@@ -1,5 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -8,6 +9,7 @@ import "./App.css";
 type Settings = {
   codex_path?: string | null;
   default_cwd?: string | null;
+  last_cwd?: string | null;
 };
 
 type SessionStatus = "running" | "done" | "error";
@@ -494,7 +496,8 @@ function App() {
         setSettings(loaded);
         setCodexPathDraft(loaded.codex_path ?? "");
         setDefaultCwdDraft(loaded.default_cwd ?? "");
-        if (!cwd.trim() && loaded.default_cwd) setCwd(loaded.default_cwd);
+        const initialCwd = loaded.last_cwd ?? loaded.default_cwd;
+        if (!cwd.trim() && initialCwd) setCwd(initialCwd);
       })
       .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -524,6 +527,32 @@ function App() {
       if (meta.status !== "running") {
         void loadSession(meta);
       }
+    } catch (e) {
+      setErrorBanner(String(e));
+    }
+  }
+
+  async function pickCwd() {
+    setErrorBanner(null);
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath: cwd.trim()
+          ? cwd.trim()
+          : settings.last_cwd ?? settings.default_cwd ?? undefined,
+      });
+      if (!selected) return;
+      const dir = Array.isArray(selected) ? selected[0] : selected;
+      if (!dir) return;
+      setCwd(dir);
+      const saved = await invoke<Settings>("save_settings", {
+        settings: {
+          ...settings,
+          last_cwd: dir,
+        },
+      });
+      setSettings(saved);
     } catch (e) {
       setErrorBanner(String(e));
     }
@@ -568,7 +597,8 @@ function App() {
       setSettings(loaded);
       setCodexPathDraft(loaded.codex_path ?? "");
       setDefaultCwdDraft(loaded.default_cwd ?? "");
-      if (!cwd.trim() && loaded.default_cwd) setCwd(loaded.default_cwd);
+      const initialCwd = loaded.last_cwd ?? loaded.default_cwd;
+      if (!cwd.trim() && initialCwd) setCwd(initialCwd);
     } catch {
       // ignore
     }
@@ -593,7 +623,8 @@ function App() {
       };
       const saved = await invoke<Settings>("save_settings", { settings: next });
       setSettings(saved);
-      if (!cwd.trim() && saved.default_cwd) setCwd(saved.default_cwd);
+      const initialCwd = saved.last_cwd ?? saved.default_cwd;
+      if (!cwd.trim() && initialCwd) setCwd(initialCwd);
       setShowSettings(false);
     } catch (e) {
       setErrorBanner(String(e));
@@ -654,12 +685,17 @@ function App() {
               rows={2}
               placeholder="Describe what you want Codex to do…"
             />
-            <input
-              className="cwd"
-              value={cwd}
-              onChange={(e) => setCwd(e.currentTarget.value)}
-              placeholder="Working directory (optional)"
-            />
+            <div className="cwdRow">
+              <input
+                className="cwd"
+                value={cwd}
+                onChange={(e) => setCwd(e.currentTarget.value)}
+                placeholder="Working directory (optional)"
+              />
+              <button className="btn" type="button" onClick={pickCwd}>
+                Pick…
+              </button>
+            </div>
           </div>
           <button className="btn primary" type="button" onClick={startRun} disabled={!prompt.trim()}>
             Run

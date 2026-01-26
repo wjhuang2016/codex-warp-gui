@@ -55,6 +55,7 @@ struct SessionMeta {
 struct Settings {
     codex_path: Option<String>,
     default_cwd: Option<String>,
+    last_cwd: Option<String>,
 }
 
 struct RunHandle {
@@ -317,11 +318,19 @@ async fn start_run(
     });
     if cwd.is_none() {
         let settings = read_settings(&app).await;
-        if let Some(path) = settings.default_cwd {
+        if let Some(path) = settings.last_cwd.or(settings.default_cwd) {
             let t = path.trim().to_string();
             if !t.is_empty() {
                 cwd = Some(t);
             }
+        }
+    }
+
+    if let Some(dir) = cwd.clone() {
+        let mut settings = read_settings(&app).await;
+        if settings.last_cwd.as_deref() != Some(dir.as_str()) {
+            settings.last_cwd = Some(dir);
+            let _ = write_settings(&app, &settings).await;
         }
     }
 
@@ -695,6 +704,7 @@ async fn detect_codex_paths_cmd(app: AppHandle) -> Result<Vec<String>, String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             start_run,

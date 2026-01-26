@@ -242,6 +242,17 @@ body {
   min-width: 0;
 }
 
+.cwdRow {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+.cwdRow .cwd {
+  flex: 1;
+}
+
 .cwd:focus {
   border-color: rgba(0, 212, 255, 0.45);
   box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.12);
