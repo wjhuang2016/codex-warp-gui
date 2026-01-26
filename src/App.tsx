@@ -187,6 +187,37 @@ function appendToBlock(
   return copy;
 }
 
+function appendDeltaToBlock(
+  blocks: Block[],
+  key: string,
+  create: () => Block,
+  delta: string,
+  ts_ms: number,
+): Block[] {
+  const idx = blocks.findIndex((b) => b.key === key);
+  if (idx === -1) {
+    const next = create();
+    return [
+      ...blocks,
+      {
+        ...next,
+        body: (next.body || "") + delta,
+        ts_ms,
+      },
+    ];
+  }
+
+  const prev = blocks[idx];
+  const updated: Block = {
+    ...prev,
+    body: (prev.body || "") + delta,
+    ts_ms,
+  };
+  const copy = blocks.slice();
+  copy[idx] = updated;
+  return copy;
+}
+
 function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
   if (e.stream === "stderr") {
     return appendToBlock(
@@ -220,6 +251,155 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
       e.raw,
       e.ts_ms,
     );
+  }
+
+  const method = typeof (e.json as any).method === "string" ? (e.json as any).method : undefined;
+  if (method) {
+    const params = isObject((e.json as any).params) ? ((e.json as any).params as any) : {};
+
+    if (method === "item/agentMessage/delta") {
+      const itemId = typeof params.itemId === "string" ? params.itemId : "";
+      const delta = typeof params.delta === "string" ? params.delta : "";
+      if (!itemId || !delta) return blocks;
+      const key = `item:${itemId}`;
+      return appendDeltaToBlock(
+        blocks,
+        key,
+        () => ({
+          id: newId(),
+          key,
+          kind: "assistant",
+          title: "Assistant",
+          body: "",
+          ts_ms: e.ts_ms,
+        }),
+        delta,
+        e.ts_ms,
+      );
+    }
+
+    if (method === "item/reasoning/summaryTextDelta" || method === "item/reasoning/textDelta") {
+      const itemId = typeof params.itemId === "string" ? params.itemId : "";
+      const delta = typeof params.delta === "string" ? params.delta : "";
+      if (!itemId || !delta) return blocks;
+      const key = `item:${itemId}`;
+      return appendDeltaToBlock(
+        blocks,
+        key,
+        () => ({
+          id: newId(),
+          key,
+          kind: "thought",
+          title: "Thought",
+          body: "",
+          ts_ms: e.ts_ms,
+        }),
+        delta,
+        e.ts_ms,
+      );
+    }
+
+    if (method === "item/commandExecution/outputDelta") {
+      const itemId = typeof params.itemId === "string" ? params.itemId : "";
+      const delta = typeof params.delta === "string" ? params.delta : "";
+      if (!itemId || !delta) return blocks;
+      const key = `item:${itemId}`;
+      return appendDeltaToBlock(
+        blocks,
+        key,
+        () => ({
+          id: newId(),
+          key,
+          kind: "command",
+          title: "Command",
+          body: "",
+          ts_ms: e.ts_ms,
+        }),
+        delta,
+        e.ts_ms,
+      );
+    }
+
+    if (method === "item/started" || method === "item/completed") {
+      const item = isObject(params.item) ? (params.item as any) : null;
+      const itemType = item && typeof item.type === "string" ? item.type : "";
+      const itemId = item && typeof item.id === "string" ? item.id : "";
+      const key = itemId ? `item:${itemId}` : `item:${e.ts_ms}:${Math.random()}`;
+
+      if (itemType === "userMessage") {
+        return blocks;
+      }
+
+      if (itemType === "agentMessage") {
+        const text = item && typeof item.text === "string" ? item.text : "";
+        if (!text) return blocks;
+        return upsertBlock(blocks, {
+          id: key,
+          key,
+          kind: "assistant",
+          title: "Assistant",
+          body: text,
+          ts_ms: e.ts_ms,
+        });
+      }
+
+      if (itemType === "commandExecution") {
+        const command = item && typeof item.command === "string" ? item.command : "";
+        const output =
+          item && typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : "";
+        const rawStatus = item && typeof item.status === "string" ? item.status : undefined;
+        const status = rawStatus === "inProgress" ? "in_progress" : rawStatus;
+        const exitCode = item && typeof item.exitCode === "number" ? ` (exit ${item.exitCode})` : "";
+        const title = status === "in_progress" ? "Command (running)" : "Command";
+        const subtitle = command ? `${summarizeCommand(command)}${exitCode}` : undefined;
+        const autoCollapse =
+          status && status !== "in_progress" && output.length > 1400 ? true : undefined;
+
+        return upsertBlock(blocks, {
+          id: key,
+          key,
+          kind: "command",
+          title,
+          subtitle,
+          body: output,
+          ts_ms: e.ts_ms,
+          status,
+          collapsed: autoCollapse,
+        });
+      }
+
+      if (itemType === "reasoning") {
+        return blocks;
+      }
+
+      return upsertBlock(blocks, {
+        id: key,
+        key,
+        kind: "event",
+        title: itemType || "item",
+        body: JSON.stringify(item ?? params, null, 2),
+        ts_ms: e.ts_ms,
+      });
+    }
+
+    if (method === "error") {
+      return [
+        ...blocks,
+        {
+          id: newId(),
+          key: `app_error:${e.ts_ms}:${Math.random()}`,
+          kind: "error",
+          title: "Error",
+          body: JSON.stringify(params ?? e.json, null, 2),
+          ts_ms: e.ts_ms,
+        },
+      ];
+    }
+
+    // Ignore other app-server notifications by default.
+    if (method === "thread/started" || method === "turn/started" || method === "turn/completed") {
+      return blocks;
+    }
   }
 
   const type = typeof e.json.type === "string" ? e.json.type : undefined;
