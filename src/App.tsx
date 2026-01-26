@@ -561,44 +561,43 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
 
 function parseMarkdownTodos(text: string): TodoItem[] {
   const out: TodoItem[] = [];
+  let inPlan = false;
   for (const line of text.split("\n")) {
     const m = line.match(/^\s*[-*]\s*\[( |x|X)\]\s+(.*)$/);
-    if (!m) continue;
-    out.push({ done: m[1].toLowerCase() === "x", text: m[2].trim() });
+    if (m) {
+      out.push({ done: m[1].toLowerCase() === "x", text: m[2].trim() });
+      continue;
+    }
+
+    const next = line.match(
+      /^\s*(next|next step|todo|tbd|后续|下一步)\s*[:：]\s*(.+)$/i,
+    );
+    if (next) {
+      out.push({ done: false, text: next[2].trim() });
+      continue;
+    }
+
+    if (/^\s*(plan|计划)\s*[:：]\s*$/i.test(line)) {
+      inPlan = true;
+      continue;
+    }
+    if (inPlan) {
+      if (!line.trim()) {
+        inPlan = false;
+        continue;
+      }
+      const n = line.match(/^\s*\d+\.\s+(.*)$/);
+      if (n) out.push({ done: false, text: n[1].trim() });
+    }
   }
   return out;
-}
-
-function extractStringsFromJson(value: any, depth = 0): string[] {
-  if (depth > 4 || value == null) return [];
-  if (typeof value === "string") return [value];
-  if (Array.isArray(value)) return value.flatMap((v) => extractStringsFromJson(v, depth + 1));
-  if (typeof value !== "object") return [];
-
-  const obj = value as Record<string, unknown>;
-  const preferredKeys = ["todos", "todo", "plan", "steps", "items", "tasks"];
-  const preferred = preferredKeys.flatMap((k) => extractStringsFromJson((obj as any)[k], depth + 1));
-  if (preferred.length) return preferred;
-  return Object.values(obj).flatMap((v) => extractStringsFromJson(v, depth + 1));
 }
 
 function extractTodos(blocks: Block[]): TodoItem[] {
   const candidates: TodoItem[] = [];
   for (const b of blocks) {
+    if (b.kind !== "assistant" && b.kind !== "thought") continue;
     candidates.push(...parseMarkdownTodos(b.body));
-
-    if (b.body.trim().startsWith("{")) {
-      try {
-        const json = JSON.parse(b.body);
-        const strs = extractStringsFromJson(json);
-        for (const s of strs) {
-          if (!s || s.length > 180) continue;
-          candidates.push({ done: false, text: s });
-        }
-      } catch {
-        // ignore
-      }
-    }
   }
 
   const dedup = new Map<string, TodoItem>();
@@ -1287,75 +1286,79 @@ function App() {
         </div>
 
         <div className="timeline" ref={timelineRef} onScroll={onTimelineScroll}>
-          {startingSessionId === activeSessionId ? (
-            <div className="emptyState">
-              <div className="emptyTitle">Starting…</div>
-              <div className="muted">Launching a fresh Codex session.</div>
-            </div>
-          ) : loadingSessionId === activeSessionId ? (
-            <div className="emptyState">
-              <div className="emptyTitle">Loading…</div>
-              <div className="muted">Reading session logs from disk.</div>
-            </div>
-          ) : filteredBlocks.length === 0 ? (
-            <div className="emptyState">
-              <div className="emptyTitle">No output yet.</div>
-              <div className="muted">
-                Run a session, or clear filters/search if you expect content here.
+          <div className="timelineInner">
+            {startingSessionId === activeSessionId ? (
+              <div className="emptyState">
+                <div className="emptyTitle">Starting…</div>
+                <div className="muted">Launching a fresh Codex session.</div>
               </div>
-            </div>
-          ) : (
-            filteredBlocks.map((b) => {
-              const subtitle =
-                b.subtitle ?? (b.collapsed ? previewText(b.body) || undefined : undefined);
-              return (
-                <section key={b.id} className={`block ${b.kind}`}>
-                  <header className="blockHeader">
-                    <div className="blockHeaderLeft">
-                      <div className="blockTitle">{b.title}</div>
-                      {subtitle ? <div className="blockSubtitle muted mono">{subtitle}</div> : null}
-                    </div>
-                    <div className="blockHeaderRight">
-                      {b.status ? <span className={`pill ${b.status}`}>{b.status}</span> : null}
-                      <button
-                        className="iconBtn"
-                        type="button"
-                        onClick={() =>
-                          setCollapsedForActiveSession(b.key, !(b.collapsed ?? false))
-                        }
-                        aria-label={b.collapsed ? "Expand block" : "Collapse block"}
-                        title={b.collapsed ? "Expand" : "Collapse"}
-                      >
-                        {b.collapsed ? "▸" : "▾"}
-                      </button>
-                      <div className="muted mono">{new Date(b.ts_ms).toLocaleTimeString()}</div>
-                    </div>
-                  </header>
-                  {b.collapsed ? null : (
-                    <div className="blockBody">
-                      {b.kind === "assistant" ? (
-                        <div className="markdown compact">
-                          <ReactMarkdown
-                            remarkPlugins={[remarkGfm]}
-                            components={markdownComponents}
-                          >
-                            {b.body}
-                          </ReactMarkdown>
+            ) : loadingSessionId === activeSessionId ? (
+              <div className="emptyState">
+                <div className="emptyTitle">Loading…</div>
+                <div className="muted">Reading session logs from disk.</div>
+              </div>
+            ) : filteredBlocks.length === 0 ? (
+              <div className="emptyState">
+                <div className="emptyTitle">No output yet.</div>
+                <div className="muted">
+                  Run a session, or clear filters/search if you expect content here.
+                </div>
+              </div>
+            ) : (
+              filteredBlocks.map((b) => {
+                const subtitle =
+                  b.subtitle ?? (b.collapsed ? previewText(b.body) || undefined : undefined);
+                return (
+                  <section key={b.id} className={`block ${b.kind}`}>
+                    <header className="blockHeader">
+                      <div className="blockHeaderLeft">
+                        <div className="blockTitle">{b.title}</div>
+                        {subtitle ? <div className="blockSubtitle muted mono">{subtitle}</div> : null}
+                      </div>
+                      <div className="blockHeaderRight">
+                        {b.status ? <span className={`pill ${b.status}`}>{b.status}</span> : null}
+                        <button
+                          className="iconBtn blockToggle"
+                          type="button"
+                          onClick={() =>
+                            setCollapsedForActiveSession(b.key, !(b.collapsed ?? false))
+                          }
+                          aria-label={b.collapsed ? "Expand block" : "Collapse block"}
+                          title={b.collapsed ? "Expand" : "Collapse"}
+                        >
+                          {b.collapsed ? "▸" : "▾"}
+                        </button>
+                        <div className="muted mono blockTime">
+                          {new Date(b.ts_ms).toLocaleTimeString()}
                         </div>
-                      ) : b.kind === "thought" ? (
-                        <pre className="blockPre mono">{b.body}</pre>
-                      ) : b.kind === "command" ? (
-                        <pre className="blockPre mono">{b.body || "(no output yet)"}</pre>
-                      ) : (
-                        <pre className="blockPre mono">{b.body}</pre>
-                      )}
-                    </div>
-                  )}
-                </section>
-              );
-            })
-          )}
-          <div className="timelineEnd" ref={timelineEndRef} />
+                      </div>
+                    </header>
+                    {b.collapsed ? null : (
+                      <div className="blockBody">
+                        {b.kind === "assistant" ? (
+                          <div className="markdown compact">
+                            <ReactMarkdown
+                              remarkPlugins={[remarkGfm]}
+                              components={markdownComponents}
+                            >
+                              {b.body}
+                            </ReactMarkdown>
+                          </div>
+                        ) : b.kind === "thought" ? (
+                          <pre className="blockPre mono">{b.body}</pre>
+                        ) : b.kind === "command" ? (
+                          <pre className="blockPre mono">{b.body || "(no output yet)"}</pre>
+                        ) : (
+                          <pre className="blockPre mono">{b.body}</pre>
+                        )}
+                      </div>
+                    )}
+                  </section>
+                );
+              })
+            )}
+            <div className="timelineEnd" ref={timelineEndRef} />
+          </div>
         </div>
 
         <div className="composer">
@@ -1430,12 +1433,18 @@ function App() {
 
         {rightTab === "todo" ? (
           <div className="panel">
-            <div className="panelTitle">TODO</div>
+            <div className="panelTitle">
+              TODO{" "}
+              <span className="muted">
+                {todos.filter((t) => t.done).length}/{todos.length}
+              </span>
+            </div>
             {todos.length > 0 ? (
               <ul className="todoList">
                 {todos.map((t) => (
-                  <li key={t.text}>
-                    {t.done ? "[x]" : "[ ]"} {t.text}
+                  <li key={`${t.done ? "1" : "0"}:${t.text}`} className={`todoItem ${t.done ? "done" : ""}`}>
+                    <span className={`todoBox ${t.done ? "done" : ""}`} aria-hidden />
+                    <span className="todoLabel">{t.text}</span>
                   </li>
                 ))}
               </ul>

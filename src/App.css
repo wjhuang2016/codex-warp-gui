@@ -7,6 +7,7 @@
   --border: rgba(255, 255, 255, 0.08);
   --accent: #7c5cff;
   --accent-2: #00d4ff;
+  --success: #32d583;
   --danger: #ff4d6d;
   --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
 
@@ -314,9 +315,17 @@ body {
 .timeline {
   flex: 1;
   overflow: auto;
-  padding: 16px;
+  padding: 18px 22px;
   min-width: 0;
   min-height: 0;
+}
+
+.timelineInner {
+  max-width: 92ch;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .timelineEnd {
@@ -337,12 +346,43 @@ body {
 }
 
 .block {
+  --block-accent: rgba(255, 255, 255, 0.14);
+  position: relative;
   background: rgba(255, 255, 255, 0.035);
   border: 1px solid var(--border);
   border-radius: 14px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
-  margin-bottom: 12px;
   overflow: hidden;
+}
+
+.block::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--block-accent);
+  border-radius: 14px 0 0 14px;
+  opacity: 0.9;
+  pointer-events: none;
+}
+
+.block.assistant {
+  --block-accent: rgba(124, 92, 255, 0.9);
+}
+.block.thought {
+  --block-accent: rgba(0, 212, 255, 0.9);
+}
+.block.command {
+  --block-accent: rgba(50, 213, 131, 0.9);
+}
+.block.error {
+  --block-accent: rgba(255, 77, 109, 0.95);
+}
+.block.status,
+.block.event {
+  --block-accent: rgba(154, 164, 178, 0.75);
 }
 
 .blockHeader {
@@ -350,9 +390,9 @@ body {
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px 12px;
+  padding: 9px 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-  background: rgba(17, 23, 42, 0.35);
+  background: rgba(17, 23, 42, 0.26);
 }
 
 .blockHeaderLeft {
@@ -367,6 +407,19 @@ body {
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
+}
+
+.blockToggle,
+.blockTime {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.block:hover .blockToggle,
+.block:hover .blockTime,
+.block:focus-within .blockToggle,
+.block:focus-within .blockTime {
+  opacity: 1;
 }
 
 .blockTitle {
@@ -387,10 +440,32 @@ body {
   min-width: 0;
 }
 
+.block.command .blockBody,
+.block.thought .blockBody,
+.block.event .blockBody {
+  max-height: 360px;
+  overflow: auto;
+}
+
 .blockPre {
   margin: 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.block.command .blockPre,
+.block.thought .blockPre,
+.block.event .blockPre {
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.block.assistant .blockBody .markdown {
+  border: none;
+  background: transparent;
+  padding: 0;
 }
 
 .detailsSummary {
@@ -461,10 +536,60 @@ body {
 
 .todoList {
   margin: 0;
-  padding-left: 16px;
+  padding-left: 0;
+  list-style: none;
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.todoItem {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 8px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 12px;
+}
+
+.todoBox {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.12);
+  margin-top: 2px;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.todoBox.done {
+  border-color: rgba(124, 92, 255, 0.55);
+  background: rgba(124, 92, 255, 0.28);
+}
+
+.todoBox.done::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid rgba(255, 255, 255, 0.92);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.todoLabel {
+  flex: 1;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.todoItem.done .todoLabel {
+  color: var(--muted);
+  text-decoration: line-through;
 }
 
 .preview {
@@ -484,6 +609,11 @@ body {
   background: rgba(255, 255, 255, 0.03);
   font-size: 13px;
   line-height: 1.55;
+}
+
+.markdown.compact {
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .markdown :is(h1, h2, h3) {
@@ -506,10 +636,37 @@ body {
   margin: 10px 0;
 }
 
+.markdown.compact :is(p, ul, ol, pre) {
+  margin: 8px 0;
+}
+
+.markdown :is(ul, ol) {
+  padding-left: 20px;
+}
+
+.markdown :is(li) {
+  margin: 6px 0;
+}
+
 .markdown :is(code) {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     "Liberation Mono", "Courier New", monospace;
   font-size: 12px;
+}
+
+.markdown :is(p, li) > code {
+  padding: 2px 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.markdown blockquote {
+  margin: 10px 0;
+  padding: 8px 12px;
+  border-left: 3px solid rgba(0, 212, 255, 0.6);
+  background: rgba(0, 0, 0, 0.14);
+  border-radius: 10px;
 }
 
 .markdown :is(pre) {
@@ -518,6 +675,29 @@ body {
   border: 1px solid rgba(255, 255, 255, 0.08);
   overflow: auto;
   background: rgba(0, 0, 0, 0.2);
+}
+
+.markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+}
+
+.markdown th,
+.markdown td {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.markdown th {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.markdown hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+  margin: 12px 0;
 }
 
 .markdown a {
