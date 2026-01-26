@@ -381,13 +381,22 @@ async fn stream_lines<R: tokio::io::AsyncRead + Unpin>(
 async fn start_run(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
+    session_id: Option<String>,
     prompt: String,
     cwd: Option<String>,
 ) -> Result<SessionMeta, String> {
-    let session_id = Uuid::new_v4().to_string();
+    let session_id = match session_id {
+        Some(s) => Uuid::parse_str(s.trim())
+            .map_err(|_| "invalid session id".to_string())?
+            .to_string(),
+        None => Uuid::new_v4().to_string(),
+    };
     let created_at_ms = now_ms();
 
     let dir = session_dir(&app, &session_id)?;
+    if tokio::fs::metadata(&dir).await.is_ok() {
+        return Err("session already exists".to_string());
+    }
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| e.to_string())?;

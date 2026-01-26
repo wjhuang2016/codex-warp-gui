@@ -58,6 +58,33 @@ function newId(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function newSessionId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  const c = globalThis.crypto;
+  if (c && typeof c.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    c.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant
+    const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0"));
+    return `${hex[0]}${hex[1]}${hex[2]}${hex[3]}-${hex[4]}${hex[5]}-${hex[6]}${hex[7]}-${hex[8]}${hex[9]}-${hex[10]}${hex[11]}${hex[12]}${hex[13]}${hex[14]}${hex[15]}`;
+  }
+
+  // Fallback (non-cryptographic), still formatted as a UUID v4.
+  const r4 = () => Math.floor(Math.random() * 0x10000).toString(16).padStart(4, "0");
+  const v4 = r4();
+  const variant = ((8 + Math.floor(Math.random() * 4)).toString(16) + r4().slice(1)).slice(0, 4);
+  return `${r4()}${r4()}-${r4()}-4${v4.slice(1)}-${variant}-${r4()}${r4()}${r4()}`;
+}
+
+function safeSessionTitle(prompt: string): string {
+  const trimmed = prompt.trim();
+  if (!trimmed) return "New session";
+  const s = trimmed.replace(/\n/g, " ");
+  if (s.length <= 60) return s;
+  return `${s.slice(0, 60)}…`;
+}
+
 type TodoItem = {
   text: string;
   done: boolean;
@@ -387,6 +414,7 @@ function App() {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
+  const [startingSessionId, setStartingSessionId] = useState<string | null>(null);
   const [blocksBySession, setBlocksBySession] = useState<Record<string, Block[]>>({});
   const [conclusionBySession, setConclusionBySession] = useState<Record<string, string>>({});
   const [prompt, setPrompt] = useState("Build a GUI around codex CLI JSONL output.");
@@ -584,19 +612,60 @@ function App() {
   }, []);
 
   async function startNewRun() {
+    const promptText = prompt.trim();
+    if (!promptText) return;
+    if (startingSessionId) return;
+    const prevActiveSessionId = activeSessionId;
+    const sessionId = newSessionId();
+
+    setStartingSessionId(sessionId);
+    setActiveSessionId(sessionId);
     setErrorBanner(null);
+
+    const nextCwd = cwd.trim() ? cwd.trim() : null;
+    const placeholder: SessionMeta = {
+      id: sessionId,
+      title: safeSessionTitle(promptText),
+      created_at_ms: Date.now(),
+      cwd: nextCwd,
+      status: "running",
+      codex_session_id: null,
+      events_path: "",
+      stderr_path: "",
+      conclusion_path: "",
+    };
+
+    setSessions((prev) => [placeholder, ...prev]);
+    setBlocksBySession((prev) => ({ ...prev, [sessionId]: [] }));
+    setConclusionBySession((prev) => ({ ...prev, [sessionId]: "" }));
+
     try {
       const meta = await invoke<SessionMeta>("start_run", {
-        prompt,
-        cwd: cwd.trim() ? cwd.trim() : null,
+        sessionId,
+        prompt: promptText,
+        cwd: nextCwd,
       });
-      setSessions((prev) => [meta, ...prev]);
-      setActiveSessionId(meta.id);
+      setSessions((prev) => prev.map((s) => (s.id === sessionId ? meta : s)));
+      setActiveSessionId(sessionId);
       if (meta.status !== "running") {
         void loadSession(meta);
       }
     } catch (e) {
+      setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+      setBlocksBySession((prev) => {
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
+      setConclusionBySession((prev) => {
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
+      setActiveSessionId(prevActiveSessionId);
       setErrorBanner(String(e));
+    } finally {
+      setStartingSessionId((cur) => (cur === sessionId ? null : cur));
     }
   }
 
@@ -727,22 +796,37 @@ function App() {
   return (
     <div className="app">
       <aside className="sidebar">
-        <div className="sidebarHeader">
-          <div className="appTitle">Codex Warp</div>
-          <div className="sidebarActions">
-            <button className="btn" type="button" onClick={startNewRun} disabled={!prompt.trim()}>
-              New
-            </button>
-            <button className="btn" type="button" onClick={renameActive} disabled={!activeSessionId}>
-              Rename
-            </button>
-            <button className="btn" type="button" onClick={deleteActive} disabled={!activeSessionId}>
-              Delete
-            </button>
-            <button className="btn" type="button" onClick={openSettings}>
-              Settings
-            </button>
-          </div>
+          <div className="sidebarHeader">
+            <div className="appTitle">Codex Warp</div>
+            <div className="sidebarActions">
+              <button
+                className="btn"
+                type="button"
+                onClick={startNewRun}
+                disabled={!prompt.trim() || startingSessionId != null}
+              >
+                New
+              </button>
+              <button
+                className="btn"
+                type="button"
+                onClick={renameActive}
+                disabled={!activeSessionId || startingSessionId != null}
+              >
+                Rename
+              </button>
+              <button
+                className="btn"
+                type="button"
+                onClick={deleteActive}
+                disabled={!activeSessionId || startingSessionId != null}
+              >
+                Delete
+              </button>
+              <button className="btn" type="button" onClick={openSettings}>
+                Settings
+              </button>
+            </div>
         </div>
 
         <div className="sidebarSectionTitle">Sessions</div>
@@ -847,7 +931,12 @@ function App() {
         </div>
 
         <div className="timeline">
-          {loadingSessionId === activeSessionId ? (
+          {startingSessionId === activeSessionId ? (
+            <div className="emptyState">
+              <div className="emptyTitle">Starting…</div>
+              <div className="muted">Launching a fresh Codex session.</div>
+            </div>
+          ) : loadingSessionId === activeSessionId ? (
             <div className="emptyState">
               <div className="emptyTitle">Loading…</div>
               <div className="muted">Reading session logs from disk.</div>
