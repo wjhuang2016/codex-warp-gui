@@ -48,6 +48,7 @@ body {
   flex-direction: column;
   padding: 14px;
   gap: 12px;
+  min-height: 0;
 }
 
 .sidebarHeader {
@@ -78,11 +79,13 @@ body {
 }
 
 .sessionList {
+  flex: 1;
   display: flex;
   flex-direction: column;
   gap: 8px;
   overflow: auto;
   padding-bottom: 8px;
+  min-height: 0;
 }
 
 .sessionRow {
@@ -144,6 +147,7 @@ body {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
 }
 
 .composer {
@@ -311,6 +315,7 @@ body {
   overflow: auto;
   padding: 16px;
   min-width: 0;
+  min-height: 0;
 }
 
 .timelineEnd {
@@ -413,6 +418,7 @@ body {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
 }
 
 .rightTabs {
@@ -437,8 +443,10 @@ body {
 }
 
 .panel {
+  flex: 1;
   padding: 12px;
   overflow: auto;
+  min-height: 0;
 }
 
 .panelTitle {
