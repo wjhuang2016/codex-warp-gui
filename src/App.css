@@ -612,8 +612,9 @@ body {
 }
 
 .markdown.compact {
-  font-size: 13px;
-  line-height: 1.6;
+  font-size: 14px;
+  line-height: 1.72;
+  letter-spacing: 0.12px;
 }
 
 .markdown :is(h1, h2, h3) {
@@ -637,15 +638,51 @@ body {
 }
 
 .markdown.compact :is(p, ul, ol, pre) {
-  margin: 8px 0;
+  margin: 10px 0;
 }
 
 .markdown :is(ul, ol) {
-  padding-left: 20px;
+  padding-left: 24px;
+  list-style-position: outside;
 }
 
 .markdown :is(li) {
+  margin: 8px 0;
+  padding-left: 2px;
+}
+
+.markdown :is(li)::marker {
+  color: rgba(0, 212, 255, 0.78);
+}
+
+.markdown :is(li > p) {
   margin: 6px 0;
+}
+
+.markdown :is(li > :first-child) {
+  margin-top: 0;
+}
+
+.markdown :is(li > :last-child) {
+  margin-bottom: 0;
+}
+
+.markdown :is(ul ul, ul ol, ol ul, ol ol) {
+  padding-left: 22px;
+  margin: 8px 0;
+}
+
+.markdown :is(li > ul, li > ol) {
+  margin-top: 8px;
+}
+
+.markdown strong {
+  font-weight: 800;
+  color: rgba(232, 236, 243, 0.98);
+}
+
+.markdown em {
+  color: rgba(0, 212, 255, 0.92);
 }
 
 .markdown :is(code) {
@@ -654,11 +691,13 @@ body {
   font-size: 12px;
 }
 
-.markdown :is(p, li) > code {
-  padding: 2px 6px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(0, 0, 0, 0.2);
+.markdown :not(pre) > code {
+  padding: 2px 7px;
+  border-radius: 9px;
+  border: 1px solid rgba(0, 212, 255, 0.22);
+  background: rgba(0, 0, 0, 0.18);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
+  color: rgba(0, 212, 255, 0.92);
 }
 
 .markdown blockquote {

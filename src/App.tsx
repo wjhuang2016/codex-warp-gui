@@ -602,7 +602,10 @@ function extractTodos(blocks: Block[]): TodoItem[] {
 
   const dedup = new Map<string, TodoItem>();
   for (const t of candidates) {
-    const key = t.text;
+    const normalized = t.text.trim();
+    if (!normalized) continue;
+    if (/^(n\/a|na|none|无|没有|不需要)$/i.test(normalized)) continue;
+    const key = normalized;
     const existing = dedup.get(key);
     if (!existing) dedup.set(key, t);
     else if (!existing.done && t.done) dedup.set(key, t);
@@ -1335,20 +1338,17 @@ function App() {
                     </header>
                     {b.collapsed ? null : (
                       <div className="blockBody">
-                        {b.kind === "assistant" ? (
-                          <div className="markdown compact">
-                            <ReactMarkdown
-                              remarkPlugins={[remarkGfm]}
-                              components={markdownComponents}
-                            >
-                              {b.body}
-                            </ReactMarkdown>
-                          </div>
-                        ) : b.kind === "thought" ? (
-                          <pre className="blockPre mono">{b.body}</pre>
-                        ) : b.kind === "command" ? (
-                          <pre className="blockPre mono">{b.body || "(no output yet)"}</pre>
-                        ) : (
+                      {b.kind === "assistant" ? (
+                        <div className="markdown compact">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                            {b.body}
+                          </ReactMarkdown>
+                        </div>
+                      ) : b.kind === "thought" ? (
+                        <pre className="blockPre mono">{b.body}</pre>
+                      ) : b.kind === "command" ? (
+                        <pre className="blockPre mono">{b.body || "(no output yet)"}</pre>
+                      ) : (
                           <pre className="blockPre mono">{b.body}</pre>
                         )}
                       </div>
