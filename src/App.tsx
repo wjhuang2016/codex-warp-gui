@@ -423,7 +423,7 @@ function App() {
   const [startingSessionId, setStartingSessionId] = useState<string | null>(null);
   const [blocksBySession, setBlocksBySession] = useState<Record<string, Block[]>>({});
   const [conclusionBySession, setConclusionBySession] = useState<Record<string, string>>({});
-  const [prompt, setPrompt] = useState("Build a GUI around codex CLI JSONL output.");
+  const [prompt, setPrompt] = useState("");
   const [cwd, setCwd] = useState("");
   const [blockQuery, setBlockQuery] = useState("");
   const [blockKindFilter, setBlockKindFilter] = useState<BlockKind | "all">("all");
