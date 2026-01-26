@@ -52,15 +52,16 @@ body {
 
 .sidebarHeader {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
 }
 
 .sidebarActions {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
-  align-items: center;
+  width: 100%;
 }
 
 .appTitle {
@@ -146,9 +147,6 @@ body {
 }
 
 .composer {
-  position: sticky;
-  bottom: 0;
-  z-index: 10;
   display: grid;
   grid-template-columns: 1fr 120px;
   gap: 12px;
