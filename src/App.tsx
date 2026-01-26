@@ -37,13 +37,17 @@ type RunFinished = {
   success: boolean;
 };
 
-type BlockKind = "plan" | "tool" | "message" | "error" | "result" | "event";
+type BlockKind = "assistant" | "command" | "thought" | "status" | "error" | "event";
 type Block = {
   id: string;
+  key: string;
   kind: BlockKind;
   title: string;
+  subtitle?: string;
   body: string;
   ts_ms: number;
+  status?: string;
+  collapsed?: boolean;
 };
 
 function newId(): string {
@@ -56,40 +60,227 @@ type TodoItem = {
   done: boolean;
 };
 
-function eventToBlock(e: UiEvent): Block {
-  const json = e.json as any;
-  const type = typeof json?.type === "string" ? json.type : undefined;
-  const kind: BlockKind =
-    e.stream === "stderr"
-      ? "error"
-      : type?.includes("plan")
-        ? "plan"
-        : type?.includes("tool") || type?.includes("command")
-          ? "tool"
-          : type?.includes("final") || type?.includes("result")
-            ? "result"
-            : type
-              ? "event"
-              : "message";
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
 
-  const title =
-    e.stream === "stderr"
-      ? "stderr"
-      : type
-        ? type
-        : e.raw.trim().startsWith("{")
-          ? "event"
-          : "message";
+function summarizeCommand(command: string): string {
+  const normalized = command.replace(/\s+/g, " ").trim();
+  const max = 120;
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, max)}…`;
+}
 
-  const body = json ? JSON.stringify(json, null, 2) : e.raw;
+function upsertBlock(blocks: Block[], next: Block): Block[] {
+  const idx = blocks.findIndex((b) => b.key === next.key);
+  if (idx === -1) return [...blocks, next];
 
-  return {
-    id: newId(),
-    kind,
-    title,
-    body,
-    ts_ms: e.ts_ms,
+  const prev = blocks[idx];
+  const updated: Block = {
+    ...prev,
+    ...next,
+    id: prev.id,
+    key: prev.key,
+    collapsed: prev.collapsed ?? next.collapsed,
   };
+
+  const copy = blocks.slice();
+  copy[idx] = updated;
+  return copy;
+}
+
+function appendToBlock(
+  blocks: Block[],
+  key: string,
+  create: () => Block,
+  line: string,
+  ts_ms: number,
+): Block[] {
+  const idx = blocks.findIndex((b) => b.key === key);
+  if (idx === -1) return [...blocks, create()];
+
+  const prev = blocks[idx];
+  const body = prev.body ? `${prev.body}\n${line}` : line;
+  const updated: Block = {
+    ...prev,
+    body,
+    ts_ms,
+  };
+  const copy = blocks.slice();
+  copy[idx] = updated;
+  return copy;
+}
+
+function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
+  if (e.stream === "stderr") {
+    return appendToBlock(
+      blocks,
+      "stderr",
+      () => ({
+        id: newId(),
+        key: "stderr",
+        kind: "error",
+        title: "stderr",
+        body: e.raw,
+        ts_ms: e.ts_ms,
+        collapsed: true,
+      }),
+      e.raw,
+      e.ts_ms,
+    );
+  }
+
+  if (!isObject(e.json)) {
+    return appendToBlock(
+      blocks,
+      "stdout_raw",
+      () => ({
+        id: newId(),
+        key: "stdout_raw",
+        kind: "event",
+        title: "stdout",
+        body: e.raw,
+        ts_ms: e.ts_ms,
+        collapsed: true,
+      }),
+      e.raw,
+      e.ts_ms,
+    );
+  }
+
+  const type = typeof e.json.type === "string" ? e.json.type : undefined;
+  if (!type) {
+    return [
+      ...blocks,
+      {
+        id: newId(),
+        key: `event:${e.ts_ms}:${Math.random()}`,
+        kind: "event",
+        title: "event",
+        body: JSON.stringify(e.json, null, 2),
+        ts_ms: e.ts_ms,
+      },
+    ];
+  }
+
+  if (type === "thread.started" || type === "turn.started") {
+    return blocks;
+  }
+
+  if (type === "turn.completed") {
+    const usage = isObject(e.json.usage) ? e.json.usage : null;
+    const inputTokens =
+      usage && typeof usage.input_tokens === "number" ? usage.input_tokens : undefined;
+    const outputTokens =
+      usage && typeof usage.output_tokens === "number" ? usage.output_tokens : undefined;
+    const body = [
+      "Turn completed.",
+      inputTokens != null ? `input_tokens: ${inputTokens}` : null,
+      outputTokens != null ? `output_tokens: ${outputTokens}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    return upsertBlock(blocks, {
+      id: "turn_summary",
+      key: "turn_summary",
+      kind: "status",
+      title: "Usage",
+      body,
+      ts_ms: e.ts_ms,
+    });
+  }
+
+  if (type === "error") {
+    const message = typeof e.json.message === "string" ? e.json.message : "Unknown error";
+    return [
+      ...blocks,
+      {
+        id: newId(),
+        key: `error:${e.ts_ms}:${Math.random()}`,
+        kind: "error",
+        title: "Error",
+        body: message,
+        ts_ms: e.ts_ms,
+      },
+    ];
+  }
+
+  if (type.startsWith("item.") && isObject(e.json.item)) {
+    const item = e.json.item as Record<string, unknown>;
+    const itemId = typeof item.id === "string" ? item.id : undefined;
+    const itemType = typeof item.type === "string" ? item.type : "item";
+    const key = itemId ? `item:${itemId}` : `item:${e.ts_ms}:${Math.random()}`;
+
+    if (itemType === "agent_message") {
+      const text = typeof item.text === "string" ? item.text : JSON.stringify(item, null, 2);
+      return upsertBlock(blocks, {
+        id: key,
+        key,
+        kind: "assistant",
+        title: "Assistant",
+        body: text,
+        ts_ms: e.ts_ms,
+      });
+    }
+
+    if (itemType === "reasoning") {
+      const text = typeof item.text === "string" ? item.text : JSON.stringify(item, null, 2);
+      return upsertBlock(blocks, {
+        id: key,
+        key,
+        kind: "thought",
+        title: "Thought",
+        body: text,
+        ts_ms: e.ts_ms,
+        collapsed: true,
+      });
+    }
+
+    if (itemType === "command_execution") {
+      const command = typeof item.command === "string" ? item.command : "";
+      const output = typeof item.aggregated_output === "string" ? item.aggregated_output : "";
+      const status = typeof item.status === "string" ? item.status : undefined;
+      const exitCode =
+        typeof item.exit_code === "number" ? ` (exit ${item.exit_code})` : "";
+
+      const autoCollapse =
+        status && status !== "in_progress" && output.length > 1400 ? true : undefined;
+
+      return upsertBlock(blocks, {
+        id: key,
+        key,
+        kind: "command",
+        title: status === "in_progress" ? "Command (running)" : "Command",
+        subtitle: `${summarizeCommand(command)}${exitCode}`,
+        body: output,
+        ts_ms: e.ts_ms,
+        status,
+        collapsed: autoCollapse,
+      });
+    }
+
+    return upsertBlock(blocks, {
+      id: key,
+      key,
+      kind: "event",
+      title: itemType,
+      body: JSON.stringify(item, null, 2),
+      ts_ms: e.ts_ms,
+    });
+  }
+
+  return [
+    ...blocks,
+    {
+      id: newId(),
+      key: `event:${type}:${e.ts_ms}:${Math.random()}`,
+      kind: "event",
+      title: type,
+      body: JSON.stringify(e.json, null, 2),
+      ts_ms: e.ts_ms,
+    },
+  ];
 }
 
 function parseMarkdownTodos(text: string): TodoItem[] {
@@ -158,6 +349,8 @@ function App() {
   const [conclusionBySession, setConclusionBySession] = useState<Record<string, string>>({});
   const [prompt, setPrompt] = useState("Build a GUI around codex CLI JSONL output.");
   const [cwd, setCwd] = useState("");
+  const [blockQuery, setBlockQuery] = useState("");
+  const [blockKindFilter, setBlockKindFilter] = useState<BlockKind | "all">("all");
   const [rightTab, setRightTab] = useState<"todo" | "preview">("todo");
 
   const blocks = useMemo(
@@ -176,6 +369,28 @@ function App() {
     [activeSessionId, conclusionBySession],
   );
 
+  const filteredBlocks = useMemo(() => {
+    const kind = blockKindFilter;
+    const q = blockQuery.trim().toLowerCase();
+    if (kind === "all" && !q) return blocks;
+
+    return blocks.filter((b) => {
+      if (kind !== "all" && b.kind !== kind) return false;
+      if (!q) return true;
+      const hay = `${b.title}\n${b.subtitle ?? ""}\n${b.body}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [blocks, blockKindFilter, blockQuery]);
+
+  function setCollapsedForActiveSession(blockKey: string, collapsed: boolean) {
+    if (!activeSessionId) return;
+    setBlocksBySession((prev) => {
+      const list = prev[activeSessionId] ?? [];
+      const nextList = list.map((b) => (b.key === blockKey ? { ...b, collapsed } : b));
+      return { ...prev, [activeSessionId]: nextList };
+    });
+  }
+
   async function loadSession(session: SessionMeta) {
     const [lines, conclusionText] = await Promise.all([
       invoke<string[]>("read_session_events", { session_id: session.id, max_lines: 2000 }).catch(
@@ -184,7 +399,7 @@ function App() {
       invoke<string>("read_conclusion", { session_id: session.id }).catch(() => ""),
     ]);
 
-    const blocks: Block[] = lines.map((raw, idx) => {
+    const events: UiEvent[] = lines.map((raw, idx) => {
       let json: unknown | null = null;
       try {
         json = JSON.parse(raw);
@@ -192,17 +407,21 @@ function App() {
         json = null;
       }
 
-      const evt: UiEvent = {
+      return {
         session_id: session.id,
         ts_ms: session.created_at_ms + idx,
         stream: "stdout",
         raw,
         json,
       };
-      return eventToBlock(evt);
     });
 
-    setBlocksBySession((prev) => ({ ...prev, [session.id]: blocks }));
+    let nextBlocks: Block[] = [];
+    for (const evt of events) {
+      nextBlocks = applyUiEventToBlocks(nextBlocks, evt);
+    }
+
+    setBlocksBySession((prev) => ({ ...prev, [session.id]: nextBlocks }));
     setConclusionBySession((prev) => ({ ...prev, [session.id]: conclusionText }));
   }
 
@@ -213,10 +432,9 @@ function App() {
     (async () => {
       unlistenEvent = await listen<UiEvent>("codex_event", ({ payload }) => {
         if (!payload?.session_id) return;
-        const block = eventToBlock(payload);
         setBlocksBySession((prev) => ({
           ...prev,
-          [payload.session_id]: [...(prev[payload.session_id] ?? []), block],
+          [payload.session_id]: applyUiEventToBlocks(prev[payload.session_id] ?? [], payload),
         }));
       });
 
@@ -232,7 +450,8 @@ function App() {
 
         const block: Block = {
           id: newId(),
-          kind: payload.success ? "result" : "error",
+          key: `run_finished:${payload.ts_ms}`,
+          kind: payload.success ? "status" : "error",
           title: payload.success ? "Run finished" : "Run failed",
           body: payload.exit_code == null ? "exit_code: null" : `exit_code: ${payload.exit_code}`,
           ts_ms: payload.ts_ms,
@@ -292,7 +511,8 @@ function App() {
       setActiveSessionId(meta.id);
       const startBlock: Block = {
         id: newId(),
-        kind: "tool",
+        key: `run_start:${Date.now()}`,
+        kind: "status",
         title: "Start",
         body: "codex exec --json --full-auto ...",
         ts_ms: Date.now(),
@@ -446,14 +666,77 @@ function App() {
           </button>
         </div>
 
+        <div className="filterBar">
+          <input
+            className="search"
+            value={blockQuery}
+            onChange={(e) => setBlockQuery(e.currentTarget.value)}
+            placeholder="Search blocks…"
+          />
+          <div className="chips">
+            {(
+              [
+                ["all", "All"],
+                ["assistant", "Assistant"],
+                ["command", "Command"],
+                ["thought", "Thought"],
+                ["status", "Status"],
+                ["error", "Error"],
+                ["event", "Event"],
+              ] as const
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                className={`chip ${blockKindFilter === key ? "active" : ""}`}
+                type="button"
+                onClick={() => setBlockKindFilter(key)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="muted mono results">
+            {filteredBlocks.length}/{blocks.length}
+          </div>
+        </div>
+
         <div className="timeline">
-          {blocks.map((b) => (
+          {filteredBlocks.map((b) => (
             <section key={b.id} className={`block ${b.kind}`}>
               <header className="blockHeader">
-                <div className="blockTitle">{b.title}</div>
-                <div className="muted mono">{new Date(b.ts_ms).toLocaleTimeString()}</div>
+                <div className="blockHeaderLeft">
+                  <div className="blockTitle">{b.title}</div>
+                  {b.subtitle ? <div className="blockSubtitle muted mono">{b.subtitle}</div> : null}
+                </div>
+                <div className="blockHeaderRight">
+                  {b.status ? <span className={`pill ${b.status}`}>{b.status}</span> : null}
+                  <button
+                    className="iconBtn"
+                    type="button"
+                    onClick={() => setCollapsedForActiveSession(b.key, !(b.collapsed ?? false))}
+                    aria-label={b.collapsed ? "Expand block" : "Collapse block"}
+                    title={b.collapsed ? "Expand" : "Collapse"}
+                  >
+                    {b.collapsed ? "▸" : "▾"}
+                  </button>
+                  <div className="muted mono">{new Date(b.ts_ms).toLocaleTimeString()}</div>
+                </div>
               </header>
-              <pre className="blockBody mono">{b.body}</pre>
+              {b.collapsed ? null : (
+                <div className="blockBody">
+                  {b.kind === "assistant" ? (
+                    <div className="markdown compact">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{b.body}</ReactMarkdown>
+                    </div>
+                  ) : b.kind === "thought" ? (
+                    <pre className="blockPre mono">{b.body}</pre>
+                  ) : b.kind === "command" ? (
+                    <pre className="blockPre mono">{b.body || "(no output yet)"}</pre>
+                  ) : (
+                    <pre className="blockPre mono">{b.body}</pre>
+                  )}
+                </div>
+              )}
             </section>
           ))}
         </div>

@@ -155,6 +155,59 @@ body {
   backdrop-filter: blur(8px);
 }
 
+.filterBar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(17, 23, 42, 0.25);
+  min-width: 0;
+}
+
+.search {
+  flex: 1;
+  min-width: 0;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 9px 12px;
+  color: var(--text);
+  outline: none;
+}
+
+.search:focus {
+  border-color: rgba(0, 212, 255, 0.45);
+  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.12);
+}
+
+.chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.chip {
+  border-radius: 999px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.chip.active {
+  border-color: rgba(0, 212, 255, 0.35);
+  background: rgba(0, 212, 255, 0.08);
+}
+
+.results {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
 .composerLeft {
   display: flex;
   flex-direction: column;
@@ -222,6 +275,25 @@ body {
   box-shadow: var(--shadow);
 }
 
+.iconBtn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.iconBtn:hover {
+  border-color: rgba(255, 255, 255, 0.16);
+  color: var(--text);
+}
+
 .timeline {
   flex: 1;
   overflow: auto;
@@ -248,16 +320,62 @@ body {
   background: rgba(17, 23, 42, 0.35);
 }
 
+.blockHeaderLeft {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.blockHeaderRight {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
 .blockTitle {
   font-weight: 700;
   font-size: 13px;
 }
 
+.blockSubtitle {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 72ch;
+}
+
 .blockBody {
-  margin: 0;
   padding: 12px;
+  min-width: 0;
+}
+
+.blockPre {
+  margin: 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.detailsSummary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.pill.in_progress {
+  border-color: rgba(0, 212, 255, 0.35);
+  color: rgba(0, 212, 255, 0.95);
+}
+
+.pill.completed {
+  border-color: rgba(124, 92, 255, 0.35);
+  color: rgba(124, 92, 255, 0.95);
+}
+
+.pill.failed {
+  border-color: rgba(255, 77, 109, 0.4);
+  color: rgba(255, 77, 109, 0.95);
 }
 
 .right {
