@@ -461,7 +461,11 @@ function App() {
   const scrollTimelineToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
     const el = timelineRef.current;
     if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior });
+    try {
+      el.scrollTo({ top: el.scrollHeight, behavior });
+    } catch {
+      el.scrollTop = el.scrollHeight;
+    }
   }, []);
 
   const updateStickToBottom = useCallback(() => {
