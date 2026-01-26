@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { confirm, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -19,6 +19,7 @@ type SessionMeta = {
   created_at_ms: number;
   cwd?: string | null;
   status: SessionStatus;
+  codex_session_id?: string | null;
   events_path: string;
   stderr_path: string;
   conclusion_path: string;
@@ -169,6 +170,36 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
         kind: "event",
         title: "event",
         body: JSON.stringify(e.json, null, 2),
+        ts_ms: e.ts_ms,
+      },
+    ];
+  }
+
+  if (type === "app.prompt") {
+    const prompt = typeof e.json.prompt === "string" ? e.json.prompt : "";
+    return [
+      ...blocks,
+      {
+        id: newId(),
+        key: `prompt:${e.ts_ms}:${Math.random()}`,
+        kind: "status",
+        title: "Prompt",
+        body: prompt,
+        ts_ms: e.ts_ms,
+      },
+    ];
+  }
+
+  if (type === "app/error") {
+    const message = typeof e.json.message === "string" ? e.json.message : "Unknown error";
+    return [
+      ...blocks,
+      {
+        id: newId(),
+        key: `app_error:${e.ts_ms}:${Math.random()}`,
+        kind: "error",
+        title: "Error",
+        body: message,
         ts_ms: e.ts_ms,
       },
     ];
@@ -355,6 +386,7 @@ function App() {
 
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
+  const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [blocksBySession, setBlocksBySession] = useState<Record<string, Block[]>>({});
   const [conclusionBySession, setConclusionBySession] = useState<Record<string, string>>({});
   const [prompt, setPrompt] = useState("Build a GUI around codex CLI JSONL output.");
@@ -362,6 +394,9 @@ function App() {
   const [blockQuery, setBlockQuery] = useState("");
   const [blockKindFilter, setBlockKindFilter] = useState<BlockKind | "all">("all");
   const [rightTab, setRightTab] = useState<"todo" | "preview">("todo");
+  const [showRename, setShowRename] = useState(false);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renameSaving, setRenameSaving] = useState(false);
 
   const blocks = useMemo(
     () => blocksBySession[activeSessionId] ?? [],
@@ -402,37 +437,74 @@ function App() {
   }
 
   async function loadSession(session: SessionMeta) {
-    const [lines, conclusionText] = await Promise.all([
-      invoke<string[]>("read_session_events", { session_id: session.id, max_lines: 2000 }).catch(
-        () => [],
-      ),
-      invoke<string>("read_conclusion", { session_id: session.id }).catch(() => ""),
-    ]);
+    const loadId = session.id;
+    setLoadingSessionId(loadId);
+    setErrorBanner(null);
+    try {
+      const [lines, stderrLines, conclusionText] = await Promise.all([
+        invoke<string[]>("read_session_events", { session_id: session.id, max_lines: 2000 }),
+        invoke<string[]>("read_session_stderr", { session_id: session.id, max_lines: 2000 }).catch(
+          () => [],
+        ),
+        invoke<string>("read_conclusion", { session_id: session.id }).catch(() => ""),
+      ]);
 
-    const events: UiEvent[] = lines.map((raw, idx) => {
-      let json: unknown | null = null;
-      try {
-        json = JSON.parse(raw);
-      } catch {
-        json = null;
+      const events: UiEvent[] = lines.map((raw, idx) => {
+        let json: unknown | null = null;
+        try {
+          json = JSON.parse(raw);
+        } catch {
+          json = null;
+        }
+
+        return {
+          session_id: session.id,
+          ts_ms: session.created_at_ms + idx,
+          stream: "stdout",
+          raw,
+          json,
+        };
+      });
+
+      const stderrEvents: UiEvent[] = stderrLines.map((raw, idx) => ({
+        session_id: session.id,
+        ts_ms: session.created_at_ms + lines.length + idx,
+        stream: "stderr",
+        raw,
+        json: null,
+      }));
+
+      let nextBlocks: Block[] = [];
+      for (const evt of [...events, ...stderrEvents]) {
+        nextBlocks = applyUiEventToBlocks(nextBlocks, evt);
       }
 
-      return {
-        session_id: session.id,
-        ts_ms: session.created_at_ms + idx,
-        stream: "stdout",
-        raw,
-        json,
-      };
-    });
-
-    let nextBlocks: Block[] = [];
-    for (const evt of events) {
-      nextBlocks = applyUiEventToBlocks(nextBlocks, evt);
+      setBlocksBySession((prev) => ({ ...prev, [session.id]: nextBlocks }));
+      setConclusionBySession((prev) => ({ ...prev, [session.id]: conclusionText }));
+    } catch (e) {
+      setErrorBanner(String(e));
+    } finally {
+      setLoadingSessionId((cur) => (cur === loadId ? null : cur));
     }
+  }
 
-    setBlocksBySession((prev) => ({ ...prev, [session.id]: nextBlocks }));
-    setConclusionBySession((prev) => ({ ...prev, [session.id]: conclusionText }));
+  async function refreshSessions(nextActiveId?: string) {
+    setErrorBanner(null);
+    try {
+      const loaded = await invoke<SessionMeta[]>("list_sessions");
+      setSessions(loaded);
+      const active =
+        nextActiveId && loaded.some((s) => s.id === nextActiveId)
+          ? nextActiveId
+          : loaded[0]?.id ?? "";
+      setActiveSessionId(active);
+      if (active) {
+        const s = loaded.find((x) => x.id === active);
+        if (s) await loadSession(s);
+      }
+    } catch (e) {
+      setErrorBanner(String(e));
+    }
   }
 
   useEffect(() => {
@@ -511,7 +583,7 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function startRun() {
+  async function startNewRun() {
     setErrorBanner(null);
     try {
       const meta = await invoke<SessionMeta>("start_run", {
@@ -520,21 +592,35 @@ function App() {
       });
       setSessions((prev) => [meta, ...prev]);
       setActiveSessionId(meta.id);
-      const startBlock: Block = {
-        id: newId(),
-        key: `run_start:${Date.now()}`,
-        kind: "status",
-        title: "Start",
-        body: "codex exec --json --full-auto ...",
-        ts_ms: Date.now(),
-      };
-      setBlocksBySession((prev) => ({
-        ...prev,
-        [meta.id]: [startBlock, ...(prev[meta.id] ?? [])],
-      }));
       if (meta.status !== "running") {
         void loadSession(meta);
       }
+    } catch (e) {
+      setErrorBanner(String(e));
+    }
+  }
+
+  async function runInActiveSession() {
+    if (!prompt.trim()) return;
+    setErrorBanner(null);
+
+    if (!activeSessionId) {
+      await startNewRun();
+      return;
+    }
+    if (activeSession?.status === "running") {
+      setErrorBanner("This session is already running.");
+      return;
+    }
+
+    try {
+      const meta = await invoke<SessionMeta>("continue_run", {
+        session_id: activeSessionId,
+        prompt,
+        cwd: cwd.trim() ? cwd.trim() : null,
+      });
+      setSessions((prev) => prev.map((s) => (s.id === meta.id ? meta : s)));
+      setActiveSessionId(meta.id);
     } catch (e) {
       setErrorBanner(String(e));
     }
@@ -568,35 +654,34 @@ function App() {
 
   async function renameActive() {
     if (!activeSession) return;
-    const title = window.prompt("Rename session", activeSession.title);
-    if (!title?.trim()) return;
-    await invoke("rename_session", { session_id: activeSession.id, title: title.trim() });
-    setSessions((prev) =>
-      prev.map((s) => (s.id === activeSession.id ? { ...s, title: title.trim() } : s)),
-    );
+    setRenameDraft(activeSession.title);
+    setShowRename(true);
   }
 
   async function deleteActive() {
     if (!activeSession) return;
-    if (!window.confirm(`Delete session "${activeSession.title}"?`)) return;
-    await invoke("delete_session", { session_id: activeSession.id });
-
-    setSessions((prev) => prev.filter((s) => s.id !== activeSession.id));
-    setBlocksBySession((prev) => {
-      const next = { ...prev };
-      delete next[activeSession.id];
-      return next;
+    setErrorBanner(null);
+    const ok = await confirm(`Delete session "${activeSession.title}"?`, {
+      title: "Delete session",
+      kind: "warning",
     });
-    setConclusionBySession((prev) => {
-      const next = { ...prev };
-      delete next[activeSession.id];
-      return next;
-    });
-
-    const remaining = sessions.filter((s) => s.id !== activeSession.id);
-    const nextActive = remaining[0];
-    setActiveSessionId(nextActive?.id ?? "");
-    if (nextActive) void loadSession(nextActive);
+    if (!ok) return;
+    try {
+      await invoke("delete_session", { session_id: activeSession.id });
+      setBlocksBySession((prev) => {
+        const next = { ...prev };
+        delete next[activeSession.id];
+        return next;
+      });
+      setConclusionBySession((prev) => {
+        const next = { ...prev };
+        delete next[activeSession.id];
+        return next;
+      });
+      await refreshSessions();
+    } catch (e) {
+      setErrorBanner(String(e));
+    }
   }
 
   async function openSettings() {
@@ -645,7 +730,7 @@ function App() {
         <div className="sidebarHeader">
           <div className="appTitle">Codex Warp</div>
           <div className="sidebarActions">
-            <button className="btn" type="button" onClick={startRun} disabled={!prompt.trim()}>
+            <button className="btn" type="button" onClick={startNewRun} disabled={!prompt.trim()}>
               New
             </button>
             <button className="btn" type="button" onClick={renameActive} disabled={!activeSessionId}>
@@ -705,8 +790,13 @@ function App() {
               </button>
             </div>
           </div>
-          <button className="btn primary" type="button" onClick={startRun} disabled={!prompt.trim()}>
-            Run
+          <button
+            className="btn primary"
+            type="button"
+            onClick={runInActiveSession}
+            disabled={!prompt.trim() || activeSession?.status === "running"}
+          >
+            {activeSessionId ? "Continue" : "Run"}
           </button>
         </div>
 
@@ -757,7 +847,12 @@ function App() {
         </div>
 
         <div className="timeline">
-          {filteredBlocks.length === 0 ? (
+          {loadingSessionId === activeSessionId ? (
+            <div className="emptyState">
+              <div className="emptyTitle">Loading…</div>
+              <div className="muted">Reading session logs from disk.</div>
+            </div>
+          ) : filteredBlocks.length === 0 ? (
             <div className="emptyState">
               <div className="emptyTitle">No output yet.</div>
               <div className="muted">
@@ -912,6 +1007,57 @@ function App() {
                 onChange={(e) => setDefaultCwdDraft(e.currentTarget.value)}
                 placeholder='e.g. "/Users/you/projects"'
               />
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showRename ? (
+        <div className="modalBackdrop" onClick={() => setShowRename(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modalHeader">
+              <div className="modalTitle">Rename session</div>
+              <button className="btn" type="button" onClick={() => setShowRename(false)}>
+                Close
+              </button>
+            </div>
+
+            <div className="field">
+              <label className="label">Title</label>
+              <input
+                className="input"
+                value={renameDraft}
+                onChange={(e) => setRenameDraft(e.currentTarget.value)}
+                placeholder="Session title"
+              />
+              <div className="row">
+                <button className="btn" type="button" onClick={() => setShowRename(false)}>
+                  Cancel
+                </button>
+                <button
+                  className="btn primary"
+                  type="button"
+                  disabled={!renameDraft.trim() || renameSaving || !activeSessionId}
+                  onClick={async () => {
+                    if (!activeSessionId) return;
+                    const title = renameDraft.trim();
+                    if (!title) return;
+                    setErrorBanner(null);
+                    setRenameSaving(true);
+                    try {
+                      await invoke("rename_session", { session_id: activeSessionId, title });
+                      setShowRename(false);
+                      await refreshSessions(activeSessionId);
+                    } catch (e) {
+                      setErrorBanner(String(e));
+                    } finally {
+                      setRenameSaving(false);
+                    }
+                  }}
+                >
+                  Save
+                </button>
+              </div>
             </div>
           </div>
         </div>
