@@ -51,6 +51,12 @@ struct SessionMeta {
     conclusion_path: String,
 }
 
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct Settings {
+    codex_path: Option<String>,
+    default_cwd: Option<String>,
+}
+
 struct RunHandle {
     cancel: Option<oneshot::Sender<()>>,
 }
@@ -74,6 +80,146 @@ fn sessions_root(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn session_dir(app: &AppHandle, session_id: &str) -> Result<PathBuf, String> {
     Ok(sessions_root(app)?.join(session_id))
+}
+
+fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(base.join("settings.json"))
+}
+
+async fn read_settings(app: &AppHandle) -> Settings {
+    let path = match settings_path(app) {
+        Ok(p) => p,
+        Err(_) => return Settings::default(),
+    };
+
+    let bytes = match tokio::fs::read(path).await {
+        Ok(b) => b,
+        Err(_) => return Settings::default(),
+    };
+
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+async fn write_settings(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+    let path = settings_path(app)?;
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tokio::fs::write(
+        path,
+        serde_json::to_vec_pretty(settings).unwrap_or_default(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            return meta.permissions().mode() & 0o111 != 0;
+        }
+    }
+    true
+}
+
+fn push_unique(out: &mut Vec<PathBuf>, path: PathBuf) {
+    if out.iter().any(|p| p == &path) {
+        return;
+    }
+    out.push(path);
+}
+
+fn detect_codex_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    // PATH lookup first.
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            let cand = dir.join("codex");
+            if is_executable(&cand) {
+                push_unique(&mut out, cand);
+            }
+        }
+    }
+
+    // Common global install locations.
+    for cand in [
+        PathBuf::from("/opt/homebrew/bin/codex"),
+        PathBuf::from("/usr/local/bin/codex"),
+        PathBuf::from("/usr/bin/codex"),
+    ] {
+        if is_executable(&cand) {
+            push_unique(&mut out, cand);
+        }
+    }
+
+    // User-level locations (nvm/asdf/pnpm).
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+
+        let asdf = home.join(".asdf/shims/codex");
+        if is_executable(&asdf) {
+            push_unique(&mut out, asdf);
+        }
+
+        let local_bin = home.join(".local/bin/codex");
+        if is_executable(&local_bin) {
+            push_unique(&mut out, local_bin);
+        }
+
+        let pnpm = home.join("Library/pnpm/codex");
+        if is_executable(&pnpm) {
+            push_unique(&mut out, pnpm);
+        }
+
+        let nvm_root = home.join(".nvm/versions/node");
+        if let Ok(rd) = std::fs::read_dir(&nvm_root) {
+            let mut entries = rd.flatten().collect::<Vec<_>>();
+            entries.sort_by_key(|e| e.file_name());
+            entries.reverse();
+
+            for entry in entries {
+                let cand = entry.path().join("bin/codex");
+                if is_executable(&cand) {
+                    push_unique(&mut out, cand);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+async fn resolve_codex_executable(app: &AppHandle) -> Result<PathBuf, String> {
+    let settings = read_settings(app).await;
+    if let Some(path) = settings.codex_path {
+        let path = PathBuf::from(path);
+        if is_executable(&path) {
+            return Ok(path);
+        }
+        return Err(format!(
+            "Configured codex_path is not executable: {}",
+            path.display()
+        ));
+    }
+
+    let candidates = detect_codex_paths();
+    if let Some(path) = candidates.into_iter().next() {
+        return Ok(path);
+    }
+
+    Err(
+        "codex executable not found. Install codex CLI or configure codex_path in Settings."
+            .to_string(),
+    )
 }
 
 async fn read_meta(path: &Path) -> Option<SessionMeta> {
@@ -161,7 +307,86 @@ async fn start_run(
     let stderr_path = dir.join("stderr.log");
     let conclusion_path = dir.join("conclusion.md");
 
-    let mut cmd = Command::new("codex");
+    let mut cwd = cwd.and_then(|s| {
+        let t = s.trim().to_string();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    });
+    if cwd.is_none() {
+        let settings = read_settings(&app).await;
+        if let Some(path) = settings.default_cwd {
+            let t = path.trim().to_string();
+            if !t.is_empty() {
+                cwd = Some(t);
+            }
+        }
+    }
+
+    let codex = match resolve_codex_executable(&app).await {
+        Ok(p) => p,
+        Err(msg) => {
+            let details = msg;
+            let candidates = detect_codex_paths()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let error = if candidates.is_empty() {
+                details
+            } else {
+                format!("{details}\n\nDetected candidates:\n{candidates}")
+            };
+
+            let _ = tokio::fs::write(&stderr_path, format!("{error}\n")).await;
+            let _ = tokio::fs::write(&conclusion_path, format!("# Error\n\n{error}\n")).await;
+            let _ = tokio::fs::write(
+                &events_path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type": "app/error",
+                        "message": error,
+                    })
+                ),
+            )
+            .await;
+
+            let meta = SessionMeta {
+                id: session_id.clone(),
+                title: safe_title(&prompt),
+                created_at_ms,
+                cwd: cwd.clone(),
+                status: SessionStatus::Error,
+                events_path: events_path.to_string_lossy().to_string(),
+                stderr_path: stderr_path.to_string_lossy().to_string(),
+                conclusion_path: conclusion_path.to_string_lossy().to_string(),
+            };
+
+            let meta_path = dir.join("meta.json");
+            let _ = tokio::fs::write(
+                &meta_path,
+                serde_json::to_vec_pretty(&meta).unwrap_or_default(),
+            )
+            .await;
+
+            let _ = app.emit(
+                "codex_run_finished",
+                RunFinished {
+                    session_id,
+                    ts_ms: now_ms(),
+                    exit_code: None,
+                    success: false,
+                },
+            );
+
+            return Ok(meta);
+        }
+    };
+
+    let mut cmd = Command::new(codex);
     cmd.arg("exec")
         .arg("--json")
         .arg("--full-auto")
@@ -178,7 +403,55 @@ async fn start_run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let error = format!("Failed to start codex: {e}");
+            let _ = tokio::fs::write(&stderr_path, format!("{error}\n")).await;
+            let _ = tokio::fs::write(&conclusion_path, format!("# Error\n\n{error}\n")).await;
+            let _ = tokio::fs::write(
+                &events_path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type": "app/error",
+                        "message": error,
+                    })
+                ),
+            )
+            .await;
+
+            let meta = SessionMeta {
+                id: session_id.clone(),
+                title: safe_title(&prompt),
+                created_at_ms,
+                cwd: cwd.clone(),
+                status: SessionStatus::Error,
+                events_path: events_path.to_string_lossy().to_string(),
+                stderr_path: stderr_path.to_string_lossy().to_string(),
+                conclusion_path: conclusion_path.to_string_lossy().to_string(),
+            };
+
+            let meta_path = dir.join("meta.json");
+            let _ = tokio::fs::write(
+                &meta_path,
+                serde_json::to_vec_pretty(&meta).unwrap_or_default(),
+            )
+            .await;
+
+            let _ = app.emit(
+                "codex_run_finished",
+                RunFinished {
+                    session_id,
+                    ts_ms: now_ms(),
+                    exit_code: None,
+                    success: false,
+                },
+            );
+
+            return Ok(meta);
+        }
+    };
     let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
     let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
 
@@ -386,6 +659,38 @@ async fn delete_session(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn get_settings(app: AppHandle) -> Result<Settings, String> {
+    Ok(read_settings(&app).await)
+}
+
+#[tauri::command]
+async fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, String> {
+    write_settings(&app, &settings).await?;
+    Ok(settings)
+}
+
+#[tauri::command]
+async fn detect_codex_paths_cmd(app: AppHandle) -> Result<Vec<String>, String> {
+    let settings = read_settings(&app).await;
+    let mut out = Vec::new();
+
+    if let Some(path) = settings.codex_path {
+        let path = path.trim();
+        if !path.is_empty() {
+            out.push(path.to_string());
+        }
+    }
+
+    for p in detect_codex_paths() {
+        out.push(p.display().to_string());
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.clone()));
+    Ok(out)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -398,7 +703,10 @@ pub fn run() {
             read_session_events,
             read_conclusion,
             rename_session,
-            delete_session
+            delete_session,
+            get_settings,
+            save_settings,
+            detect_codex_paths_cmd
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

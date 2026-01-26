@@ -5,6 +5,11 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./App.css";
 
+type Settings = {
+  codex_path?: string | null;
+  default_cwd?: string | null;
+};
+
 type SessionStatus = "running" | "done" | "error";
 type SessionMeta = {
   id: string;
@@ -41,6 +46,11 @@ type Block = {
   ts_ms: number;
 };
 
+function newId(): string {
+  if ("crypto" in window && "randomUUID" in crypto) return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 type TodoItem = {
   text: string;
   done: boolean;
@@ -74,7 +84,7 @@ function eventToBlock(e: UiEvent): Block {
   const body = json ? JSON.stringify(json, null, 2) : e.raw;
 
   return {
-    id: crypto.randomUUID(),
+    id: newId(),
     kind,
     title,
     body,
@@ -135,12 +145,19 @@ function extractTodos(blocks: Block[]): TodoItem[] {
 }
 
 function App() {
+  const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settings, setSettings] = useState<Settings>({});
+  const [codexPathDraft, setCodexPathDraft] = useState("");
+  const [defaultCwdDraft, setDefaultCwdDraft] = useState("");
+  const [detectedCodexPaths, setDetectedCodexPaths] = useState<string[]>([]);
+
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [blocksBySession, setBlocksBySession] = useState<Record<string, Block[]>>({});
   const [conclusionBySession, setConclusionBySession] = useState<Record<string, string>>({});
   const [prompt, setPrompt] = useState("Build a GUI around codex CLI JSONL output.");
-  const [cwd, setCwd] = useState("/Users/bba");
+  const [cwd, setCwd] = useState("");
   const [rightTab, setRightTab] = useState<"todo" | "preview">("todo");
 
   const blocks = useMemo(
@@ -214,7 +231,7 @@ function App() {
         );
 
         const block: Block = {
-          id: crypto.randomUUID(),
+          id: newId(),
           kind: payload.success ? "result" : "error",
           title: payload.success ? "Run finished" : "Run failed",
           body: payload.exit_code == null ? "exit_code: null" : `exit_code: ${payload.exit_code}`,
@@ -252,14 +269,44 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    void invoke<Settings>("get_settings")
+      .then((loaded) => {
+        setSettings(loaded);
+        setCodexPathDraft(loaded.codex_path ?? "");
+        setDefaultCwdDraft(loaded.default_cwd ?? "");
+        if (!cwd.trim() && loaded.default_cwd) setCwd(loaded.default_cwd);
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function startRun() {
-    const meta = await invoke<SessionMeta>("start_run", {
-      prompt,
-      cwd: cwd.trim() ? cwd.trim() : null,
-    });
-    setSessions((prev) => [meta, ...prev]);
-    setActiveSessionId(meta.id);
-    setBlocksBySession((prev) => ({ ...prev, [meta.id]: [] }));
+    setErrorBanner(null);
+    try {
+      const meta = await invoke<SessionMeta>("start_run", {
+        prompt,
+        cwd: cwd.trim() ? cwd.trim() : null,
+      });
+      setSessions((prev) => [meta, ...prev]);
+      setActiveSessionId(meta.id);
+      const startBlock: Block = {
+        id: newId(),
+        kind: "tool",
+        title: "Start",
+        body: "codex exec --json --full-auto ...",
+        ts_ms: Date.now(),
+      };
+      setBlocksBySession((prev) => ({
+        ...prev,
+        [meta.id]: [startBlock, ...(prev[meta.id] ?? [])],
+      }));
+      if (meta.status !== "running") {
+        void loadSession(meta);
+      }
+    } catch (e) {
+      setErrorBanner(String(e));
+    }
   }
 
   async function renameActive() {
@@ -295,6 +342,44 @@ function App() {
     if (nextActive) void loadSession(nextActive);
   }
 
+  async function openSettings() {
+    try {
+      const loaded = await invoke<Settings>("get_settings");
+      setSettings(loaded);
+      setCodexPathDraft(loaded.codex_path ?? "");
+      setDefaultCwdDraft(loaded.default_cwd ?? "");
+      if (!cwd.trim() && loaded.default_cwd) setCwd(loaded.default_cwd);
+    } catch {
+      // ignore
+    }
+    setShowSettings(true);
+  }
+
+  async function detectCodex() {
+    try {
+      const paths = await invoke<string[]>("detect_codex_paths_cmd");
+      setDetectedCodexPaths(paths);
+    } catch (e) {
+      setErrorBanner(String(e));
+    }
+  }
+
+  async function saveSettingsDraft() {
+    try {
+      const next: Settings = {
+        ...settings,
+        codex_path: codexPathDraft.trim() ? codexPathDraft.trim() : null,
+        default_cwd: defaultCwdDraft.trim() ? defaultCwdDraft.trim() : null,
+      };
+      const saved = await invoke<Settings>("save_settings", { settings: next });
+      setSettings(saved);
+      if (!cwd.trim() && saved.default_cwd) setCwd(saved.default_cwd);
+      setShowSettings(false);
+    } catch (e) {
+      setErrorBanner(String(e));
+    }
+  }
+
   return (
     <div className="app">
       <aside className="sidebar">
@@ -309,6 +394,9 @@ function App() {
             </button>
             <button className="btn" type="button" onClick={deleteActive} disabled={!activeSessionId}>
               Delete
+            </button>
+            <button className="btn" type="button" onClick={openSettings}>
+              Settings
             </button>
           </div>
         </div>
@@ -336,6 +424,7 @@ function App() {
       </aside>
 
       <main className="main">
+        {errorBanner ? <div className="errorBanner">{errorBanner}</div> : null}
         <div className="composer">
           <div className="composerLeft">
             <textarea
@@ -414,6 +503,65 @@ function App() {
           </div>
         )}
       </aside>
+
+      {showSettings ? (
+        <div className="modalBackdrop" onClick={() => setShowSettings(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modalHeader">
+              <div className="modalTitle">Settings</div>
+              <button className="btn" type="button" onClick={() => setShowSettings(false)}>
+                Close
+              </button>
+            </div>
+
+            <div className="field">
+              <label className="label">Codex executable path</label>
+              <input
+                className="input"
+                value={codexPathDraft}
+                onChange={(e) => setCodexPathDraft(e.currentTarget.value)}
+                placeholder='e.g. "/opt/homebrew/bin/codex"'
+              />
+              <div className="row">
+                <button className="btn" type="button" onClick={detectCodex}>
+                  Detect
+                </button>
+                <button className="btn primary" type="button" onClick={saveSettingsDraft}>
+                  Save
+                </button>
+              </div>
+              {detectedCodexPaths.length > 0 ? (
+                <div className="detected">
+                  <div className="muted">Detected:</div>
+                  <ul>
+                    {detectedCodexPaths.map((p) => (
+                      <li key={p}>
+                        <button
+                          className="linkBtn mono"
+                          type="button"
+                          onClick={() => setCodexPathDraft(p)}
+                        >
+                          {p}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="field">
+              <label className="label">Default working directory</label>
+              <input
+                className="input"
+                value={defaultCwdDraft}
+                onChange={(e) => setDefaultCwdDraft(e.currentTarget.value)}
+                placeholder='e.g. "/Users/you/projects"'
+              />
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
