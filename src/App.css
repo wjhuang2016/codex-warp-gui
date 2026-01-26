@@ -312,6 +312,19 @@ body {
   min-width: 0;
 }
 
+.emptyState {
+  border: 1px dashed rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.14);
+  border-radius: 16px;
+  padding: 18px;
+  max-width: 80ch;
+}
+
+.emptyTitle {
+  font-weight: 800;
+  margin-bottom: 6px;
+}
+
 .block {
   background: rgba(255, 255, 255, 0.035);
   border: 1px solid var(--border);

@@ -73,6 +73,17 @@ function summarizeCommand(command: string): string {
   return `${normalized.slice(0, max)}…`;
 }
 
+function previewText(text: string): string {
+  const first = text
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.length > 0);
+  if (!first) return "";
+  const max = 140;
+  if (first.length <= max) return first;
+  return `${first.slice(0, max)}…`;
+}
+
 function upsertBlock(blocks: Block[], next: Block): Block[] {
   const idx = blocks.findIndex((b) => b.key === next.key);
   if (idx === -1) return [...blocks, next];
@@ -125,7 +136,6 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
         title: "stderr",
         body: e.raw,
         ts_ms: e.ts_ms,
-        collapsed: true,
       }),
       e.raw,
       e.ts_ms,
@@ -143,7 +153,6 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
         title: "stdout",
         body: e.raw,
         ts_ms: e.ts_ms,
-        collapsed: true,
       }),
       e.raw,
       e.ts_ms,
@@ -235,7 +244,6 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
         title: "Thought",
         body: text,
         ts_ms: e.ts_ms,
-        collapsed: true,
       });
     }
 
@@ -730,6 +738,18 @@ function App() {
                 {label}
               </button>
             ))}
+            {blockKindFilter !== "all" || blockQuery.trim() ? (
+              <button
+                className="chip"
+                type="button"
+                onClick={() => {
+                  setBlockKindFilter("all");
+                  setBlockQuery("");
+                }}
+              >
+                Reset
+              </button>
+            ) : null}
           </div>
           <div className="muted mono results">
             {filteredBlocks.length}/{blocks.length}
@@ -737,44 +757,59 @@ function App() {
         </div>
 
         <div className="timeline">
-          {filteredBlocks.map((b) => (
-            <section key={b.id} className={`block ${b.kind}`}>
-              <header className="blockHeader">
-                <div className="blockHeaderLeft">
-                  <div className="blockTitle">{b.title}</div>
-                  {b.subtitle ? <div className="blockSubtitle muted mono">{b.subtitle}</div> : null}
-                </div>
-                <div className="blockHeaderRight">
-                  {b.status ? <span className={`pill ${b.status}`}>{b.status}</span> : null}
-                  <button
-                    className="iconBtn"
-                    type="button"
-                    onClick={() => setCollapsedForActiveSession(b.key, !(b.collapsed ?? false))}
-                    aria-label={b.collapsed ? "Expand block" : "Collapse block"}
-                    title={b.collapsed ? "Expand" : "Collapse"}
-                  >
-                    {b.collapsed ? "▸" : "▾"}
-                  </button>
-                  <div className="muted mono">{new Date(b.ts_ms).toLocaleTimeString()}</div>
-                </div>
-              </header>
-              {b.collapsed ? null : (
-                <div className="blockBody">
-                  {b.kind === "assistant" ? (
-                    <div className="markdown compact">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{b.body}</ReactMarkdown>
+          {filteredBlocks.length === 0 ? (
+            <div className="emptyState">
+              <div className="emptyTitle">No output yet.</div>
+              <div className="muted">
+                Run a session, or clear filters/search if you expect content here.
+              </div>
+            </div>
+          ) : (
+            filteredBlocks.map((b) => {
+              const subtitle =
+                b.subtitle ?? (b.collapsed ? previewText(b.body) || undefined : undefined);
+              return (
+                <section key={b.id} className={`block ${b.kind}`}>
+                  <header className="blockHeader">
+                    <div className="blockHeaderLeft">
+                      <div className="blockTitle">{b.title}</div>
+                      {subtitle ? <div className="blockSubtitle muted mono">{subtitle}</div> : null}
                     </div>
-                  ) : b.kind === "thought" ? (
-                    <pre className="blockPre mono">{b.body}</pre>
-                  ) : b.kind === "command" ? (
-                    <pre className="blockPre mono">{b.body || "(no output yet)"}</pre>
-                  ) : (
-                    <pre className="blockPre mono">{b.body}</pre>
+                    <div className="blockHeaderRight">
+                      {b.status ? <span className={`pill ${b.status}`}>{b.status}</span> : null}
+                      <button
+                        className="iconBtn"
+                        type="button"
+                        onClick={() =>
+                          setCollapsedForActiveSession(b.key, !(b.collapsed ?? false))
+                        }
+                        aria-label={b.collapsed ? "Expand block" : "Collapse block"}
+                        title={b.collapsed ? "Expand" : "Collapse"}
+                      >
+                        {b.collapsed ? "▸" : "▾"}
+                      </button>
+                      <div className="muted mono">{new Date(b.ts_ms).toLocaleTimeString()}</div>
+                    </div>
+                  </header>
+                  {b.collapsed ? null : (
+                    <div className="blockBody">
+                      {b.kind === "assistant" ? (
+                        <div className="markdown compact">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{b.body}</ReactMarkdown>
+                        </div>
+                      ) : b.kind === "thought" ? (
+                        <pre className="blockPre mono">{b.body}</pre>
+                      ) : b.kind === "command" ? (
+                        <pre className="blockPre mono">{b.body || "(no output yet)"}</pre>
+                      ) : (
+                        <pre className="blockPre mono">{b.body}</pre>
+                      )}
+                    </div>
                   )}
-                </div>
-              )}
-            </section>
-          ))}
+                </section>
+              );
+            })
+          )}
         </div>
       </main>
 
