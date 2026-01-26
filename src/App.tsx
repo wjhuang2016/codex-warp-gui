@@ -237,27 +237,7 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
   }
 
   if (type === "turn.completed") {
-    const usage = isObject(e.json.usage) ? e.json.usage : null;
-    const inputTokens =
-      usage && typeof usage.input_tokens === "number" ? usage.input_tokens : undefined;
-    const outputTokens =
-      usage && typeof usage.output_tokens === "number" ? usage.output_tokens : undefined;
-    const body = [
-      "Turn completed.",
-      inputTokens != null ? `input_tokens: ${inputTokens}` : null,
-      outputTokens != null ? `output_tokens: ${outputTokens}` : null,
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-    return upsertBlock(blocks, {
-      id: "turn_summary",
-      key: "turn_summary",
-      kind: "status",
-      title: "Usage",
-      body,
-      ts_ms: e.ts_ms,
-    });
+    return blocks;
   }
 
   if (type === "error") {
@@ -432,6 +412,10 @@ function App() {
   const scrollStateBySessionRef = useRef<
     Record<string, { scrollTop: number; stickToBottom: boolean }>
   >({});
+  const activeSessionIdRef = useRef("");
+  const activeSessionStatusRef = useRef<SessionStatus | null>(null);
+  const showSettingsRef = useRef(false);
+  const showRenameRef = useRef(false);
 
   const blocks = useMemo(
     () => blocksBySession[activeSessionId] ?? EMPTY_BLOCKS,
@@ -442,6 +426,38 @@ function App() {
     () => sessions.find((s) => s.id === activeSessionId),
     [activeSessionId, sessions],
   );
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+    activeSessionStatusRef.current = activeSession?.status ?? null;
+    showSettingsRef.current = showSettings;
+    showRenameRef.current = showRename;
+  }, [activeSession?.status, activeSessionId, showRename, showSettings]);
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      if (showSettingsRef.current) {
+        e.preventDefault();
+        setShowSettings(false);
+        return;
+      }
+      if (showRenameRef.current) {
+        e.preventDefault();
+        setShowRename(false);
+        return;
+      }
+      if (activeSessionStatusRef.current !== "running") return;
+      const sid = activeSessionIdRef.current;
+      if (!sid) return;
+      e.preventDefault();
+      setErrorBanner(null);
+      void invoke("stop_run", { sessionId: sid }).catch((err) => setErrorBanner(String(err)));
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const todos = useMemo(() => extractTodos(blocks), [blocks]);
   const conclusion = useMemo(
@@ -637,18 +653,11 @@ function App() {
         ),
       );
 
-      const block: Block = {
-        id: `run_finished:${payload.ts_ms}`,
-        key: `run_finished:${payload.ts_ms}`,
-        kind: payload.success ? "status" : "error",
-        title: payload.success ? "Run finished" : "Run failed",
-        body: payload.exit_code == null ? "exit_code: null" : `exit_code: ${payload.exit_code}`,
-        ts_ms: payload.ts_ms,
-      };
-      setBlocksBySession((prev) => ({
-        ...prev,
-        [payload.session_id]: upsertBlock(prev[payload.session_id] ?? [], block),
-      }));
+      if (!payload.success && payload.session_id === activeSessionIdRef.current) {
+        const msg =
+          payload.exit_code == null ? "Run stopped." : `Run failed (exit ${payload.exit_code}).`;
+        setErrorBanner(msg);
+      }
 
       void invoke<string>("read_conclusion", { sessionId: payload.session_id })
         .then((text) => setConclusionBySession((prev) => ({ ...prev, [payload.session_id]: text })))
@@ -1065,6 +1074,26 @@ function App() {
               className="prompt"
               value={prompt}
               onChange={(e) => setPrompt(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  const native = e.nativeEvent as any;
+                  const isComposing = Boolean(native && native.isComposing);
+                  if (isComposing) return;
+                  if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+                  e.preventDefault();
+                  void runInActiveSession();
+                }
+                if (e.key === "Escape") {
+                  if (!activeSessionId) return;
+                  if (activeSession?.status !== "running") return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setErrorBanner(null);
+                  void invoke("stop_run", { sessionId: activeSessionId }).catch((err) =>
+                    setErrorBanner(String(err)),
+                  );
+                }
+              }}
               rows={2}
               placeholder="Describe what you want Codex to do…"
             />
