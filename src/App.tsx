@@ -204,17 +204,15 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
 
   if (type === "app.prompt") {
     const prompt = typeof e.json.prompt === "string" ? e.json.prompt : "";
-    return [
-      ...blocks,
-      {
-        id: newId(),
-        key: `prompt:${e.ts_ms}:${Math.random()}`,
-        kind: "status",
-        title: "Prompt",
-        body: prompt,
-        ts_ms: e.ts_ms,
-      },
-    ];
+    const key = `prompt:${e.ts_ms}`;
+    return upsertBlock(blocks, {
+      id: key,
+      key,
+      kind: "status",
+      title: "Prompt",
+      body: prompt,
+      ts_ms: e.ts_ms,
+    });
   }
 
   if (type === "app/error") {
@@ -536,50 +534,56 @@ function App() {
   }
 
   useEffect(() => {
-    let unlistenEvent: (() => void) | undefined;
-    let unlistenFinished: (() => void) | undefined;
+    let disposed = false;
+    let unlistenEvent: (() => void) | null = null;
+    let unlistenFinished: (() => void) | null = null;
 
-    (async () => {
-      unlistenEvent = await listen<UiEvent>("codex_event", ({ payload }) => {
-        if (!payload?.session_id) return;
-        setBlocksBySession((prev) => ({
-          ...prev,
-          [payload.session_id]: applyUiEventToBlocks(prev[payload.session_id] ?? [], payload),
-        }));
-      });
+    void listen<UiEvent>("codex_event", ({ payload }) => {
+      if (!payload?.session_id) return;
+      setBlocksBySession((prev) => ({
+        ...prev,
+        [payload.session_id]: applyUiEventToBlocks(prev[payload.session_id] ?? [], payload),
+      }));
+    })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else unlistenEvent = unlisten;
+      })
+      .catch(() => {});
 
-      unlistenFinished = await listen<RunFinished>("codex_run_finished", ({ payload }) => {
-        if (!payload?.session_id) return;
-        setSessions((prev) =>
-          prev.map((s) =>
-            s.id === payload.session_id
-              ? { ...s, status: payload.success ? "done" : "error" }
-              : s,
-          ),
-        );
+    void listen<RunFinished>("codex_run_finished", ({ payload }) => {
+      if (!payload?.session_id) return;
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === payload.session_id ? { ...s, status: payload.success ? "done" : "error" } : s,
+        ),
+      );
 
-        const block: Block = {
-          id: newId(),
-          key: `run_finished:${payload.ts_ms}`,
-          kind: payload.success ? "status" : "error",
-          title: payload.success ? "Run finished" : "Run failed",
-          body: payload.exit_code == null ? "exit_code: null" : `exit_code: ${payload.exit_code}`,
-          ts_ms: payload.ts_ms,
-        };
-        setBlocksBySession((prev) => ({
-          ...prev,
-          [payload.session_id]: [...(prev[payload.session_id] ?? []), block],
-        }));
+      const block: Block = {
+        id: `run_finished:${payload.ts_ms}`,
+        key: `run_finished:${payload.ts_ms}`,
+        kind: payload.success ? "status" : "error",
+        title: payload.success ? "Run finished" : "Run failed",
+        body: payload.exit_code == null ? "exit_code: null" : `exit_code: ${payload.exit_code}`,
+        ts_ms: payload.ts_ms,
+      };
+      setBlocksBySession((prev) => ({
+        ...prev,
+        [payload.session_id]: upsertBlock(prev[payload.session_id] ?? [], block),
+      }));
 
-        void invoke<string>("read_conclusion", { sessionId: payload.session_id })
-          .then((text) =>
-            setConclusionBySession((prev) => ({ ...prev, [payload.session_id]: text })),
-          )
-          .catch(() => {});
-      });
-    })();
+      void invoke<string>("read_conclusion", { sessionId: payload.session_id })
+        .then((text) => setConclusionBySession((prev) => ({ ...prev, [payload.session_id]: text })))
+        .catch(() => {});
+    })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else unlistenFinished = unlisten;
+      })
+      .catch(() => {});
 
     return () => {
+      disposed = true;
       unlistenEvent?.();
       unlistenFinished?.();
     };
@@ -676,7 +680,8 @@ function App() {
   }
 
   async function runInActiveSession() {
-    if (!prompt.trim()) return;
+    const promptText = prompt.trim();
+    if (!promptText) return;
     setErrorBanner(null);
 
     if (!activeSessionId) {
@@ -691,7 +696,7 @@ function App() {
     try {
       const meta = await invoke<SessionMeta>("continue_run", {
         sessionId: activeSessionId,
-        prompt,
+        prompt: promptText,
         cwd: cwd.trim() ? cwd.trim() : null,
       });
       setSessions((prev) => prev.map((s) => (s.id === meta.id ? meta : s)));
