@@ -1,8 +1,10 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open as openDialog } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./App.css";
 
@@ -85,6 +87,30 @@ function safeSessionTitle(prompt: string): string {
   const s = trimmed.replace(/\n/g, " ");
   if (s.length <= 60) return s;
   return `${s.slice(0, 60)}…`;
+}
+
+function toExternalUrl(href: string): string | null {
+  const t = href.trim();
+  if (!t) return null;
+
+  try {
+    const u = new URL(t);
+    if (u.protocol === "http:" || u.protocol === "https:" || u.protocol === "mailto:") {
+      return u.toString();
+    }
+    return null;
+  } catch {
+    // Handle bare domains like "github.com/tauri-apps/tauri"
+    if (/^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}(\/.*)?$/.test(t)) {
+      try {
+        const u = new URL(`https://${t}`);
+        return u.toString();
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
 }
 
 type TodoItem = {
@@ -425,6 +451,33 @@ function App() {
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeSessionId),
     [activeSessionId, sessions],
+  );
+
+  const markdownComponents: Components = useMemo(
+    () => ({
+      a({ node: _node, href, children, ...props }) {
+        return (
+          <a
+            {...props}
+            href={href}
+            onClick={(e) => {
+              e.preventDefault();
+              const raw = typeof href === "string" ? href : "";
+              const url = raw ? toExternalUrl(raw) : null;
+              if (!url) {
+                setErrorBanner(raw ? `Cannot open link: ${raw}` : "Cannot open link.");
+                return;
+              }
+              setErrorBanner(null);
+              void openUrl(url).catch((err) => setErrorBanner(String(err)));
+            }}
+          >
+            {children}
+          </a>
+        );
+      },
+    }),
+    [],
   );
 
   useEffect(() => {
@@ -1050,7 +1103,12 @@ function App() {
                     <div className="blockBody">
                       {b.kind === "assistant" ? (
                         <div className="markdown compact">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{b.body}</ReactMarkdown>
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            components={markdownComponents}
+                          >
+                            {b.body}
+                          </ReactMarkdown>
                         </div>
                       ) : b.kind === "thought" ? (
                         <pre className="blockPre mono">{b.body}</pre>
@@ -1157,7 +1215,7 @@ function App() {
           <div className="panel">
             <div className="panelTitle">Conclusion.md</div>
             <div className="markdown">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
                 {conclusion.trim() ? conclusion : "_No conclusion yet._"}
               </ReactMarkdown>
             </div>
