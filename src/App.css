@@ -146,11 +146,14 @@ body {
 }
 
 .composer {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
   display: grid;
   grid-template-columns: 1fr 120px;
   gap: 12px;
   padding: 14px;
-  border-bottom: 1px solid var(--border);
+  border-top: 1px solid var(--border);
   background: rgba(17, 23, 42, 0.45);
   backdrop-filter: blur(8px);
 }
@@ -308,8 +311,12 @@ body {
 .timeline {
   flex: 1;
   overflow: auto;
-  padding: 16px 16px 80px;
+  padding: 16px;
   min-width: 0;
+}
+
+.timelineEnd {
+  height: 1px;
 }
 
 .emptyState {

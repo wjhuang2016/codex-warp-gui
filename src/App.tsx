@@ -1,10 +1,12 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open as openDialog } from "@tauri-apps/plugin-dialog";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./App.css";
+
+const EMPTY_BLOCKS: Block[] = [];
 
 type Settings = {
   codex_path?: string | null;
@@ -424,8 +426,11 @@ function App() {
   const [renameDraft, setRenameDraft] = useState("");
   const [renameSaving, setRenameSaving] = useState(false);
 
+  const timelineRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
+
   const blocks = useMemo(
-    () => blocksBySession[activeSessionId] ?? [],
+    () => blocksBySession[activeSessionId] ?? EMPTY_BLOCKS,
     [activeSessionId, blocksBySession],
   );
 
@@ -452,6 +457,30 @@ function App() {
       return hay.includes(q);
     });
   }, [blocks, blockKindFilter, blockQuery]);
+
+  const scrollTimelineToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
+    const el = timelineRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+  }, []);
+
+  const updateStickToBottom = useCallback(() => {
+    const el = timelineRef.current;
+    if (!el) return;
+    const threshold = 120;
+    stickToBottomRef.current =
+      el.scrollTop + el.clientHeight >= Math.max(0, el.scrollHeight - threshold);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!stickToBottomRef.current) return;
+    scrollTimelineToBottom("auto");
+  }, [blocks, scrollTimelineToBottom]);
+
+  useLayoutEffect(() => {
+    stickToBottomRef.current = true;
+    scrollTimelineToBottom("auto");
+  }, [activeSessionId, scrollTimelineToBottom]);
 
   function setCollapsedForActiveSession(blockKey: string, collapsed: boolean) {
     if (!activeSessionId) return;
@@ -622,6 +651,7 @@ function App() {
     const prevActiveSessionId = activeSessionId;
     const sessionId = newSessionId();
 
+    stickToBottomRef.current = true;
     setStartingSessionId(sessionId);
     setActiveSessionId(sessionId);
     setErrorBanner(null);
@@ -682,6 +712,7 @@ function App() {
   async function runInActiveSession() {
     const promptText = prompt.trim();
     if (!promptText) return;
+    stickToBottomRef.current = true;
     setErrorBanner(null);
 
     if (!activeSessionId) {
@@ -864,37 +895,6 @@ function App() {
 
       <main className="main">
         {errorBanner ? <div className="errorBanner">{errorBanner}</div> : null}
-        <div className="composer">
-          <div className="composerLeft">
-            <textarea
-              className="prompt"
-              value={prompt}
-              onChange={(e) => setPrompt(e.currentTarget.value)}
-              rows={2}
-              placeholder="Describe what you want Codex to do…"
-            />
-            <div className="cwdRow">
-              <input
-                className="cwd"
-                value={cwd}
-                onChange={(e) => setCwd(e.currentTarget.value)}
-                placeholder="Working directory (optional)"
-              />
-              <button className="btn" type="button" onClick={pickCwd}>
-                Pick…
-              </button>
-            </div>
-          </div>
-          <button
-            className="btn primary"
-            type="button"
-            onClick={runInActiveSession}
-            disabled={!prompt.trim() || activeSession?.status === "running"}
-          >
-            {activeSessionId ? "Continue" : "Run"}
-          </button>
-        </div>
-
         <div className="filterBar">
           <input
             className="search"
@@ -941,7 +941,7 @@ function App() {
           </div>
         </div>
 
-        <div className="timeline">
+        <div className="timeline" ref={timelineRef} onScroll={updateStickToBottom}>
           {startingSessionId === activeSessionId ? (
             <div className="emptyState">
               <div className="emptyTitle">Starting…</div>
@@ -1005,6 +1005,38 @@ function App() {
               );
             })
           )}
+          <div className="timelineEnd" />
+        </div>
+
+        <div className="composer">
+          <div className="composerLeft">
+            <textarea
+              className="prompt"
+              value={prompt}
+              onChange={(e) => setPrompt(e.currentTarget.value)}
+              rows={2}
+              placeholder="Describe what you want Codex to do…"
+            />
+            <div className="cwdRow">
+              <input
+                className="cwd"
+                value={cwd}
+                onChange={(e) => setCwd(e.currentTarget.value)}
+                placeholder="Working directory (optional)"
+              />
+              <button className="btn" type="button" onClick={pickCwd}>
+                Pick…
+              </button>
+            </div>
+          </div>
+          <button
+            className="btn primary"
+            type="button"
+            onClick={runInActiveSession}
+            disabled={!prompt.trim() || activeSession?.status === "running"}
+          >
+            {activeSessionId ? "Continue" : "Run"}
+          </button>
         </div>
       </main>
 
