@@ -256,8 +256,35 @@ body {
   min-width: 0;
 }
 
-.cwdRow .cwd {
+.cwdRow .cwd,
+.cwdRow .cwdShell {
   flex: 1;
+}
+
+.cwdShell {
+  height: 44px;
+  max-height: 44px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 6px 8px;
+  min-width: 0;
+}
+
+.cwdShell:focus-within {
+  border-color: rgba(0, 212, 255, 0.45);
+  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.12);
+}
+
+.cwdShell .xterm,
+.cwdShell .xterm-screen,
+.cwdShell .xterm-viewport {
+  background: transparent !important;
+}
+
+.cwdShell .xterm-viewport {
+  overflow: hidden !important;
 }
 
 .cwd:focus {

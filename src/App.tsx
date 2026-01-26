@@ -7,6 +7,7 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./App.css";
+import { CwdShell } from "./CwdShell";
 
 const EMPTY_BLOCKS: Block[] = [];
 
@@ -694,6 +695,10 @@ function App() {
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
+      const target = e.target as HTMLElement | null;
+      if (target && target.closest(".cwdShell")) {
+        return;
+      }
       if (showSettingsRef.current) {
         e.preventDefault();
         setShowSettings(false);
@@ -1096,6 +1101,7 @@ function App() {
       const dir = Array.isArray(selected) ? selected[0] : selected;
       if (!dir) return;
       setCwd(dir);
+      void invoke("shell_cd", { cwd: dir }).catch(() => {});
       const saved = await invoke<Settings>("save_settings", {
         settings: {
           ...settings,
@@ -1391,11 +1397,13 @@ function App() {
               placeholder="Describe what you want Codex to do…"
             />
             <div className="cwdRow">
-              <input
-                className="cwd"
-                value={cwd}
-                onChange={(e) => setCwd(e.currentTarget.value)}
-                placeholder="Working directory (optional)"
+              <CwdShell
+                initialCwd={cwd}
+                onCwd={(next) => {
+                  if (cwd === next) return;
+                  setCwd(next);
+                }}
+                onError={(msg) => setErrorBanner(msg)}
               />
               <button className="btn" type="button" onClick={pickCwd}>
                 Pick…

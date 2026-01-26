@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -14,6 +15,8 @@ use tokio::{
     time::{timeout, Duration},
 };
 use uuid::Uuid;
+
+const SHELL_CWD_MARKER: &[u8] = b"__CODEX_CWD__=";
 
 #[derive(Clone, Serialize)]
 struct UiEvent {
@@ -30,6 +33,16 @@ struct RunFinished {
     ts_ms: u64,
     exit_code: Option<i32>,
     success: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct ShellOutput {
+    data: String,
+}
+
+#[derive(Clone, Serialize)]
+struct ShellCwd {
+    cwd: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -66,9 +79,17 @@ struct RunHandle {
     cancel: Option<oneshot::Sender<()>>,
 }
 
+struct ShellHandle {
+    master: Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    writer: Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    child: Arc<std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    _reader_thread: Option<std::thread::JoinHandle<()>>,
+}
+
 #[derive(Default)]
 struct AppState {
     runs: Arc<Mutex<HashMap<String, RunHandle>>>,
+    shell: Arc<Mutex<Option<ShellHandle>>>,
 }
 
 fn now_ms() -> u64 {
@@ -90,6 +111,162 @@ fn session_dir(app: &AppHandle, session_id: &str) -> Result<PathBuf, String> {
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
     Ok(base.join("settings.json"))
+}
+
+fn shell_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(base.join("shell"))
+}
+
+fn escape_single_quotes(s: &str) -> String {
+    // Wrap in single quotes and escape internal single quotes in a POSIX-compatible way.
+    // Example: abc'd -> 'abc'"'"'d'
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\"'\"'");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn choose_initial_cwd(settings: &Settings, requested: Option<String>) -> Option<String> {
+    let mut cwd = requested.and_then(|s| {
+        let t = s.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    });
+    if cwd.is_none() {
+        if let Some(path) = settings.last_cwd.clone().or(settings.default_cwd.clone()) {
+            let t = path.trim().to_string();
+            if !t.is_empty() {
+                cwd = Some(t);
+            }
+        }
+    }
+    cwd
+}
+
+fn stream_shell_output(
+    app: AppHandle,
+    reader: Box<dyn Read + Send>,
+    emit_cwd: bool,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buf = [0u8; 8192];
+        let mut pending_marker: Vec<u8> = Vec::new();
+        let mut in_marker_line = false;
+        let mut marker_cwd: Vec<u8> = Vec::new();
+        let mut skip_lf = false;
+
+        let mut utf8_carry: Vec<u8> = Vec::new();
+
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let mut out: Vec<u8> = Vec::with_capacity(n);
+
+            for &b in &buf[..n] {
+                if skip_lf {
+                    skip_lf = false;
+                    if b == b'\n' {
+                        continue;
+                    }
+                }
+
+                if in_marker_line {
+                    if b == b'\n' || b == b'\r' {
+                        if emit_cwd {
+                            let cwd = String::from_utf8_lossy(&marker_cwd).trim().to_string();
+                            if !cwd.is_empty() {
+                                let _ = app.emit("shell_cwd", ShellCwd { cwd });
+                            }
+                        }
+                        marker_cwd.clear();
+                        in_marker_line = false;
+                        if b == b'\r' {
+                            skip_lf = true;
+                        }
+                        continue;
+                    }
+                    marker_cwd.push(b);
+                    continue;
+                }
+
+                if !pending_marker.is_empty() || b == SHELL_CWD_MARKER[0] {
+                    let expected = SHELL_CWD_MARKER.get(pending_marker.len()).copied();
+                    if expected == Some(b) {
+                        pending_marker.push(b);
+                        if pending_marker.len() == SHELL_CWD_MARKER.len() {
+                            pending_marker.clear();
+                            in_marker_line = true;
+                            marker_cwd.clear();
+                        }
+                        continue;
+                    }
+                    if !pending_marker.is_empty() {
+                        out.extend_from_slice(&pending_marker);
+                        pending_marker.clear();
+                        if b == SHELL_CWD_MARKER[0] {
+                            pending_marker.push(b);
+                            continue;
+                        }
+                    }
+                }
+
+                out.push(b);
+            }
+
+            if out.is_empty() {
+                continue;
+            }
+
+            if !utf8_carry.is_empty() {
+                let mut merged = Vec::with_capacity(utf8_carry.len() + out.len());
+                merged.extend_from_slice(&utf8_carry);
+                merged.extend_from_slice(&out);
+                match std::str::from_utf8(&merged) {
+                    Ok(s) => {
+                        utf8_carry.clear();
+                        let _ = app.emit("shell_output", ShellOutput { data: s.to_string() });
+                    }
+                    Err(e) => {
+                        let valid = e.valid_up_to();
+                        let (good, rest) = merged.split_at(valid);
+                        if !good.is_empty() {
+                            let s = unsafe { std::str::from_utf8_unchecked(good) };
+                            let _ = app.emit("shell_output", ShellOutput { data: s.to_string() });
+                        }
+                        utf8_carry.clear();
+                        utf8_carry.extend_from_slice(rest);
+                    }
+                }
+                continue;
+            }
+
+            match std::str::from_utf8(&out) {
+                Ok(s) => {
+                    let _ = app.emit("shell_output", ShellOutput { data: s.to_string() });
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    let (good, rest) = out.split_at(valid);
+                    if !good.is_empty() {
+                        let s = unsafe { std::str::from_utf8_unchecked(good) };
+                        let _ = app.emit("shell_output", ShellOutput { data: s.to_string() });
+                    }
+                    utf8_carry.extend_from_slice(rest);
+                }
+            }
+        }
+    })
 }
 
 async fn read_settings(app: &AppHandle) -> Settings {
@@ -1646,6 +1823,191 @@ async fn detect_codex_paths_cmd(app: AppHandle) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+#[tauri::command]
+async fn start_shell(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    cwd: Option<String>,
+) -> Result<(), String> {
+    {
+        let shell = state.shell.lock().await;
+        if shell.is_some() {
+            return Ok(());
+        }
+    }
+
+    let settings = read_settings(&app).await;
+    let initial_cwd = choose_initial_cwd(&settings, cwd);
+
+    let root = shell_root(&app)?;
+    tokio::fs::create_dir_all(&root)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Use our own ZDOTDIR so we can inject a precmd hook to emit cwd changes.
+    // We still source the user's ~/.zshrc to preserve aliases/functions.
+    let zshrc = root.join(".zshrc");
+    let zshrc_text = r#"
+# codex-warp-gui embedded zsh
+if [[ -f "$HOME/.zshrc" ]]; then
+  source "$HOME/.zshrc"
+fi
+
+function __codex_emit_cwd() {
+  print -r -- "__CODEX_CWD__=$PWD"
+}
+typeset -ga precmd_functions
+precmd_functions+=(__codex_emit_cwd)
+__codex_emit_cwd
+
+# Keep prompt compact in the embedded panel
+PROMPT='%F{cyan}%~%f %# '
+RPROMPT=''
+"#;
+    tokio::fs::write(&zshrc, zshrc_text)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let app_for_thread = app.clone();
+    let root_for_env = root.clone();
+    let initial_cwd_for_spawn = initial_cwd.clone();
+
+    let handle = tokio::task::spawn_blocking(move || -> Result<ShellHandle, String> {
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system
+            .openpty(portable_pty::PtySize {
+                rows: 10,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut cmd = portable_pty::CommandBuilder::new("/bin/zsh");
+        cmd.arg("-i");
+        cmd.env("ZDOTDIR", root_for_env.as_os_str());
+        cmd.env("TERM", "xterm-256color");
+        if let Some(dir) = initial_cwd_for_spawn.clone() {
+            cmd.cwd(dir);
+        }
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| e.to_string())?;
+
+        let master_box = pair.master;
+        let writer = master_box.take_writer().map_err(|e| e.to_string())?;
+        let reader = master_box.try_clone_reader().map_err(|e| e.to_string())?;
+        let master = Arc::new(std::sync::Mutex::new(master_box));
+
+        let writer = Arc::new(std::sync::Mutex::new(writer));
+        let child = Arc::new(std::sync::Mutex::new(child));
+        let reader_thread = Some(stream_shell_output(app_for_thread, reader, true));
+
+        Ok(ShellHandle {
+            master,
+            writer,
+            child,
+            _reader_thread: reader_thread,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    {
+        let mut shell = state.shell.lock().await;
+        *shell = Some(handle);
+    }
+
+    // If we already know the initial cwd, also emit it once so UI syncs immediately.
+    if let Some(dir) = initial_cwd {
+        let _ = app.emit("shell_cwd", ShellCwd { cwd: dir });
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn shell_write(state: tauri::State<'_, AppState>, data: String) -> Result<(), String> {
+    let writer = {
+        let shell = state.shell.lock().await;
+        let Some(handle) = shell.as_ref() else {
+            return Err("shell not started".to_string());
+        };
+        handle.writer.clone()
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let mut w = writer.lock().unwrap();
+        let _ = w.write_all(data.as_bytes());
+        let _ = w.flush();
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn shell_resize(
+    state: tauri::State<'_, AppState>,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let master = {
+        let shell = state.shell.lock().await;
+        let Some(handle) = shell.as_ref() else {
+            return Err("shell not started".to_string());
+        };
+        handle.master.clone()
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let m = master.lock().unwrap();
+        let _ = m.resize(portable_pty::PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn shell_cd(state: tauri::State<'_, AppState>, cwd: String) -> Result<(), String> {
+    let dir = cwd.trim();
+    if dir.is_empty() {
+        return Ok(());
+    }
+    let cmd = format!("cd {}\r", escape_single_quotes(dir));
+    shell_write(state, cmd).await
+}
+
+#[tauri::command]
+async fn stop_shell(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let handle = {
+        let mut shell = state.shell.lock().await;
+        shell.take()
+    };
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+
+    tokio::task::spawn_blocking(move || {
+        if let Ok(mut child) = handle.child.lock() {
+            let _ = child.kill();
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1665,7 +2027,12 @@ pub fn run() {
             delete_session,
             get_settings,
             save_settings,
-            detect_codex_paths_cmd
+            detect_codex_paths_cmd,
+            start_shell,
+            shell_write,
+            shell_resize,
+            shell_cd,
+            stop_shell
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
