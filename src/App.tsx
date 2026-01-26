@@ -669,6 +669,12 @@ function App() {
     }
   }
 
+  function beginNewSession() {
+    if (startingSessionId != null) return;
+    setErrorBanner(null);
+    setActiveSessionId("");
+  }
+
   async function runInActiveSession() {
     if (!prompt.trim()) return;
     setErrorBanner(null);
@@ -802,8 +808,8 @@ function App() {
               <button
                 className="btn"
                 type="button"
-                onClick={startNewRun}
-                disabled={!prompt.trim() || startingSessionId != null}
+                onClick={beginNewSession}
+                disabled={startingSessionId != null}
               >
                 New
               </button>
