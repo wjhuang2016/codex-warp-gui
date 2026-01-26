@@ -262,6 +262,31 @@ async fn try_find_codex_session_id(events_path: &Path) -> Option<String> {
     None
 }
 
+fn strip_tool_citations(text: &str) -> String {
+    // Some OpenAI tool annotations are encoded using private-use Unicode characters
+    // like `\u{E200}` ... `\u{E201}` (e.g. citations). In a plain-text GUI these can
+    // show up as "garbled" glyph boxes, so we remove them for the conclusion file.
+    const START: &str = "\u{E200}";
+    const END: &str = "\u{E201}";
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(START) {
+        out.push_str(&rest[..start]);
+        while out.ends_with(' ') || out.ends_with('\t') {
+            out.pop();
+        }
+        let after_start = &rest[start + START.len()..];
+        if let Some(end_rel) = after_start.find(END) {
+            rest = &after_start[end_rel + END.len()..];
+        } else {
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 async fn update_conclusion_from_events(dir: &Path) -> Result<(), String> {
     let events_path = dir.join("events.jsonl");
     let file = match tokio::fs::File::open(&events_path).await {
@@ -311,7 +336,8 @@ async fn update_conclusion_from_events(dir: &Path) -> Result<(), String> {
     }
 
     if let Some(text) = last_message {
-        tokio::fs::write(dir.join("conclusion.md"), text)
+        let cleaned = strip_tool_citations(&text);
+        tokio::fs::write(dir.join("conclusion.md"), cleaned)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1054,8 +1080,9 @@ async fn run_turn_via_app_server(
         success = false;
     }
 
-    if !agent_text.trim().is_empty() {
-        let _ = tokio::fs::write(&conclusion_path, agent_text).await;
+    let cleaned_agent_text = strip_tool_citations(&agent_text);
+    if !cleaned_agent_text.trim().is_empty() {
+        let _ = tokio::fs::write(&conclusion_path, cleaned_agent_text).await;
     } else if let Some(dir) = meta_path.parent() {
         let _ = update_conclusion_from_events(dir).await;
     }

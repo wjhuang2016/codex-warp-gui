@@ -96,6 +96,13 @@ function sortSessionsByRecency(items: SessionMeta[]): SessionMeta[] {
     .sort((a, b) => (b.last_used_at_ms || b.created_at_ms) - (a.last_used_at_ms || a.created_at_ms));
 }
 
+const TOOL_MARKUP_RE = /[ \t]*\uE200[^\uE201]*\uE201/g;
+function stripToolCitations(text: string): string {
+  if (!text) return text;
+  if (!text.includes("\uE200")) return text;
+  return text.replace(TOOL_MARKUP_RE, "");
+}
+
 function toExternalUrl(href: string): string | null {
   const t = href.trim();
   if (!t) return null;
@@ -228,10 +235,10 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
         key: "stderr",
         kind: "error",
         title: "stderr",
-        body: e.raw,
+        body: stripToolCitations(e.raw),
         ts_ms: e.ts_ms,
       }),
-      e.raw,
+      stripToolCitations(e.raw),
       e.ts_ms,
     );
   }
@@ -259,7 +266,7 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
 
     if (method === "item/agentMessage/delta") {
       const itemId = typeof params.itemId === "string" ? params.itemId : "";
-      const delta = typeof params.delta === "string" ? params.delta : "";
+      const delta = stripToolCitations(typeof params.delta === "string" ? params.delta : "");
       if (!itemId || !delta) return blocks;
       const key = `item:${itemId}`;
       return appendDeltaToBlock(
@@ -280,7 +287,7 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
 
     if (method === "item/reasoning/summaryTextDelta" || method === "item/reasoning/textDelta") {
       const itemId = typeof params.itemId === "string" ? params.itemId : "";
-      const delta = typeof params.delta === "string" ? params.delta : "";
+      const delta = stripToolCitations(typeof params.delta === "string" ? params.delta : "");
       if (!itemId || !delta) return blocks;
       const key = `item:${itemId}`;
       return appendDeltaToBlock(
@@ -301,7 +308,7 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
 
     if (method === "item/commandExecution/outputDelta") {
       const itemId = typeof params.itemId === "string" ? params.itemId : "";
-      const delta = typeof params.delta === "string" ? params.delta : "";
+      const delta = stripToolCitations(typeof params.delta === "string" ? params.delta : "");
       if (!itemId || !delta) return blocks;
       const key = `item:${itemId}`;
       return appendDeltaToBlock(
@@ -331,7 +338,7 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
       }
 
       if (itemType === "agentMessage") {
-        const text = item && typeof item.text === "string" ? item.text : "";
+        const text = stripToolCitations(item && typeof item.text === "string" ? item.text : "");
         if (!text) return blocks;
         return upsertBlock(blocks, {
           id: key,
@@ -346,7 +353,9 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
       if (itemType === "commandExecution") {
         const command = item && typeof item.command === "string" ? item.command : "";
         const output =
-          item && typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : "";
+          stripToolCitations(
+            item && typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : "",
+          );
         const rawStatus = item && typeof item.status === "string" ? item.status : undefined;
         const status = rawStatus === "inProgress" ? "in_progress" : rawStatus;
         const exitCode = item && typeof item.exitCode === "number" ? ` (exit ${item.exitCode})` : "";
@@ -418,7 +427,7 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
   }
 
   if (type === "app.prompt") {
-    const prompt = typeof e.json.prompt === "string" ? e.json.prompt : "";
+    const prompt = stripToolCitations(typeof e.json.prompt === "string" ? e.json.prompt : "");
     const key = `prompt:${e.ts_ms}`;
     return upsertBlock(blocks, {
       id: key,
@@ -475,7 +484,9 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
     const key = itemId ? `item:${itemId}` : `item:${e.ts_ms}:${Math.random()}`;
 
     if (itemType === "agent_message") {
-      const text = typeof item.text === "string" ? item.text : JSON.stringify(item, null, 2);
+      const text = stripToolCitations(
+        typeof item.text === "string" ? item.text : JSON.stringify(item, null, 2),
+      );
       return upsertBlock(blocks, {
         id: key,
         key,
@@ -487,7 +498,9 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
     }
 
     if (itemType === "reasoning") {
-      const text = typeof item.text === "string" ? item.text : JSON.stringify(item, null, 2);
+      const text = stripToolCitations(
+        typeof item.text === "string" ? item.text : JSON.stringify(item, null, 2),
+      );
       return upsertBlock(blocks, {
         id: key,
         key,
@@ -500,7 +513,9 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
 
     if (itemType === "command_execution") {
       const command = typeof item.command === "string" ? item.command : "";
-      const output = typeof item.aggregated_output === "string" ? item.aggregated_output : "";
+      const output = stripToolCitations(
+        typeof item.aggregated_output === "string" ? item.aggregated_output : "",
+      );
       const status = typeof item.status === "string" ? item.status : undefined;
       const exitCode =
         typeof item.exit_code === "number" ? ` (exit ${item.exit_code})` : "";
@@ -840,7 +855,10 @@ function App() {
       }
 
       setBlocksBySession((prev) => ({ ...prev, [session.id]: nextBlocks }));
-      setConclusionBySession((prev) => ({ ...prev, [session.id]: conclusionText }));
+      setConclusionBySession((prev) => ({
+        ...prev,
+        [session.id]: stripToolCitations(conclusionText),
+      }));
     } catch (e) {
       setErrorBanner(String(e));
     } finally {
@@ -901,7 +919,12 @@ function App() {
       }
 
       void invoke<string>("read_conclusion", { sessionId: payload.session_id })
-        .then((text) => setConclusionBySession((prev) => ({ ...prev, [payload.session_id]: text })))
+        .then((text) =>
+          setConclusionBySession((prev) => ({
+            ...prev,
+            [payload.session_id]: stripToolCitations(text),
+          })),
+        )
         .catch(() => {});
     })
       .then((unlisten) => {
