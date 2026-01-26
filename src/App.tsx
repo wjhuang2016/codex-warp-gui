@@ -427,7 +427,11 @@ function App() {
   const [renameSaving, setRenameSaving] = useState(false);
 
   const timelineRef = useRef<HTMLDivElement | null>(null);
+  const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
+  const scrollStateBySessionRef = useRef<
+    Record<string, { scrollTop: number; stickToBottom: boolean }>
+  >({});
 
   const blocks = useMemo(
     () => blocksBySession[activeSessionId] ?? EMPTY_BLOCKS,
@@ -458,32 +462,73 @@ function App() {
     });
   }, [blocks, blockKindFilter, blockQuery]);
 
-  const scrollTimelineToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
+  const persistScrollStateForActiveSession = useCallback(() => {
     const el = timelineRef.current;
     if (!el) return;
-    try {
-      el.scrollTo({ top: el.scrollHeight, behavior });
-    } catch {
-      el.scrollTop = el.scrollHeight;
+    if (!activeSessionId) return;
+    const threshold = 120;
+    const stickToBottom =
+      el.scrollTop + el.clientHeight >= Math.max(0, el.scrollHeight - threshold);
+    stickToBottomRef.current = stickToBottom;
+    scrollStateBySessionRef.current[activeSessionId] = {
+      scrollTop: el.scrollTop,
+      stickToBottom,
+    };
+  }, [activeSessionId]);
+
+  const scrollTimelineToBottom = useCallback(() => {
+    const el = timelineRef.current;
+    if (!el) return;
+    const end = timelineEndRef.current;
+    if (end) {
+      try {
+        // Legacy WebKit signature aligns element bottom when arg is false.
+        end.scrollIntoView(false);
+        return;
+      } catch {
+        // ignore
+      }
     }
+    el.scrollTop = el.scrollHeight;
   }, []);
 
-  const updateStickToBottom = useCallback(() => {
-    const el = timelineRef.current;
-    if (!el) return;
-    const threshold = 120;
-    stickToBottomRef.current =
-      el.scrollTop + el.clientHeight >= Math.max(0, el.scrollHeight - threshold);
-  }, []);
+  const onTimelineScroll = useCallback(() => {
+    persistScrollStateForActiveSession();
+  }, [persistScrollStateForActiveSession]);
 
   useLayoutEffect(() => {
     if (!stickToBottomRef.current) return;
-    scrollTimelineToBottom("auto");
+    scrollTimelineToBottom();
+    const id = requestAnimationFrame(() => {
+      if (!stickToBottomRef.current) return;
+      scrollTimelineToBottom();
+    });
+    return () => cancelAnimationFrame(id);
   }, [blocks, scrollTimelineToBottom]);
 
   useLayoutEffect(() => {
-    stickToBottomRef.current = true;
-    scrollTimelineToBottom("auto");
+    const el = timelineRef.current;
+    if (!el) return;
+
+    if (!activeSessionId) {
+      stickToBottomRef.current = true;
+      scrollTimelineToBottom();
+      return;
+    }
+
+    const saved = scrollStateBySessionRef.current[activeSessionId];
+    if (!saved) {
+      stickToBottomRef.current = true;
+      scrollTimelineToBottom();
+      return;
+    }
+
+    stickToBottomRef.current = saved.stickToBottom;
+    if (saved.stickToBottom) {
+      scrollTimelineToBottom();
+    } else {
+      el.scrollTop = saved.scrollTop;
+    }
   }, [activeSessionId, scrollTimelineToBottom]);
 
   function setCollapsedForActiveSession(blockKey: string, collapsed: boolean) {
@@ -709,6 +754,7 @@ function App() {
 
   function beginNewSession() {
     if (startingSessionId != null) return;
+    persistScrollStateForActiveSession();
     setErrorBanner(null);
     setActiveSessionId("");
   }
@@ -883,6 +929,7 @@ function App() {
               type="button"
               className={`sessionRow ${s.id === activeSessionId ? "active" : ""}`}
               onClick={() => {
+                persistScrollStateForActiveSession();
                 setActiveSessionId(s.id);
                 void loadSession(s);
               }}
@@ -945,7 +992,7 @@ function App() {
           </div>
         </div>
 
-        <div className="timeline" ref={timelineRef} onScroll={updateStickToBottom}>
+        <div className="timeline" ref={timelineRef} onScroll={onTimelineScroll}>
           {startingSessionId === activeSessionId ? (
             <div className="emptyState">
               <div className="emptyTitle">Starting…</div>
@@ -1009,7 +1056,7 @@ function App() {
               );
             })
           )}
-          <div className="timelineEnd" />
+          <div className="timelineEnd" ref={timelineEndRef} />
         </div>
 
         <div className="composer">
