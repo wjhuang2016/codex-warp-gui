@@ -442,11 +442,11 @@ function App() {
     setErrorBanner(null);
     try {
       const [lines, stderrLines, conclusionText] = await Promise.all([
-        invoke<string[]>("read_session_events", { session_id: session.id, max_lines: 2000 }),
-        invoke<string[]>("read_session_stderr", { session_id: session.id, max_lines: 2000 }).catch(
+        invoke<string[]>("read_session_events", { sessionId: session.id, maxLines: 2000 }),
+        invoke<string[]>("read_session_stderr", { sessionId: session.id, maxLines: 2000 }).catch(
           () => [],
         ),
-        invoke<string>("read_conclusion", { session_id: session.id }).catch(() => ""),
+        invoke<string>("read_conclusion", { sessionId: session.id }).catch(() => ""),
       ]);
 
       const events: UiEvent[] = lines.map((raw, idx) => {
@@ -543,7 +543,7 @@ function App() {
           [payload.session_id]: [...(prev[payload.session_id] ?? []), block],
         }));
 
-        void invoke<string>("read_conclusion", { session_id: payload.session_id })
+        void invoke<string>("read_conclusion", { sessionId: payload.session_id })
           .then((text) =>
             setConclusionBySession((prev) => ({ ...prev, [payload.session_id]: text })),
           )
@@ -615,7 +615,7 @@ function App() {
 
     try {
       const meta = await invoke<SessionMeta>("continue_run", {
-        session_id: activeSessionId,
+        sessionId: activeSessionId,
         prompt,
         cwd: cwd.trim() ? cwd.trim() : null,
       });
@@ -667,7 +667,7 @@ function App() {
     });
     if (!ok) return;
     try {
-      await invoke("delete_session", { session_id: activeSession.id });
+      await invoke("delete_session", { sessionId: activeSession.id });
       setBlocksBySession((prev) => {
         const next = { ...prev };
         delete next[activeSession.id];
@@ -1045,7 +1045,7 @@ function App() {
                     setErrorBanner(null);
                     setRenameSaving(true);
                     try {
-                      await invoke("rename_session", { session_id: activeSessionId, title });
+                      await invoke("rename_session", { sessionId: activeSessionId, title });
                       setShowRename(false);
                       await refreshSessions(activeSessionId);
                     } catch (e) {
