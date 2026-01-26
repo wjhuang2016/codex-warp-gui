@@ -44,6 +44,8 @@ struct SessionMeta {
     id: String,
     title: String,
     created_at_ms: u64,
+    #[serde(default)]
+    last_used_at_ms: u64,
     cwd: Option<String>,
     status: SessionStatus,
     codex_session_id: Option<String>,
@@ -226,7 +228,11 @@ async fn resolve_codex_executable(app: &AppHandle) -> Result<PathBuf, String> {
 
 async fn read_meta(path: &Path) -> Option<SessionMeta> {
     let bytes = tokio::fs::read(path).await.ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let mut meta: SessionMeta = serde_json::from_slice(&bytes).ok()?;
+    if meta.last_used_at_ms == 0 {
+        meta.last_used_at_ms = meta.created_at_ms;
+    }
+    Some(meta)
 }
 
 async fn write_meta(path: &Path, meta: &SessionMeta) -> Result<(), String> {
@@ -392,6 +398,7 @@ async fn start_run(
         None => Uuid::new_v4().to_string(),
     };
     let created_at_ms = now_ms();
+    let last_used_at_ms = created_at_ms;
 
     let dir = session_dir(&app, &session_id)?;
     if tokio::fs::metadata(&dir).await.is_ok() {
@@ -464,6 +471,7 @@ async fn start_run(
                 id: session_id.clone(),
                 title: safe_title(&prompt),
                 created_at_ms,
+                last_used_at_ms,
                 cwd: cwd.clone(),
                 status: SessionStatus::Error,
                 codex_session_id: None,
@@ -564,6 +572,7 @@ async fn start_run(
                 id: session_id.clone(),
                 title: safe_title(&prompt),
                 created_at_ms,
+                last_used_at_ms,
                 cwd: cwd.clone(),
                 status: SessionStatus::Error,
                 codex_session_id: None,
@@ -610,6 +619,7 @@ async fn start_run(
         id: session_id.clone(),
         title: safe_title(&prompt),
         created_at_ms,
+        last_used_at_ms,
         cwd: cwd.clone(),
         status: SessionStatus::Running,
         codex_session_id: None,
@@ -764,6 +774,7 @@ async fn continue_run(
 
     meta.status = SessionStatus::Running;
     meta.cwd = cwd.clone();
+    meta.last_used_at_ms = now_ms();
     meta.events_path = events_path.to_string_lossy().to_string();
     meta.stderr_path = stderr_path.to_string_lossy().to_string();
     meta.conclusion_path = conclusion_path.to_string_lossy().to_string();
@@ -998,7 +1009,7 @@ async fn list_sessions(app: AppHandle) -> Result<Vec<SessionMeta>, String> {
         }
     }
 
-    sessions.sort_by_key(|s| Reverse(s.created_at_ms));
+    sessions.sort_by_key(|s| Reverse(s.last_used_at_ms.max(s.created_at_ms)));
     Ok(sessions)
 }
 
@@ -1070,6 +1081,18 @@ async fn rename_session(app: AppHandle, session_id: String, title: String) -> Re
 }
 
 #[tauri::command]
+async fn touch_session(app: AppHandle, session_id: String) -> Result<SessionMeta, String> {
+    let dir = session_dir(&app, &session_id)?;
+    let meta_path = dir.join("meta.json");
+    let Some(mut meta) = read_meta(&meta_path).await else {
+        return Err("meta.json not found".to_string());
+    };
+    meta.last_used_at_ms = now_ms();
+    write_meta(&meta_path, &meta).await?;
+    Ok(meta)
+}
+
+#[tauri::command]
 async fn delete_session(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
@@ -1131,6 +1154,7 @@ pub fn run() {
             read_session_stderr,
             read_conclusion,
             rename_session,
+            touch_session,
             delete_session,
             get_settings,
             save_settings,

@@ -95,6 +95,7 @@ body {
   border-radius: 12px;
   padding: 10px 10px;
   cursor: pointer;
+  color: var(--text);
 }
 
 .sessionRow:hover {

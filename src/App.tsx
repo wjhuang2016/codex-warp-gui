@@ -21,6 +21,7 @@ type SessionMeta = {
   id: string;
   title: string;
   created_at_ms: number;
+  last_used_at_ms: number;
   cwd?: string | null;
   status: SessionStatus;
   codex_session_id?: string | null;
@@ -87,6 +88,12 @@ function safeSessionTitle(prompt: string): string {
   const s = trimmed.replace(/\n/g, " ");
   if (s.length <= 60) return s;
   return `${s.slice(0, 60)}…`;
+}
+
+function sortSessionsByRecency(items: SessionMeta[]): SessionMeta[] {
+  return items
+    .slice()
+    .sort((a, b) => (b.last_used_at_ms || b.created_at_ms) - (a.last_used_at_ms || a.created_at_ms));
 }
 
 function toExternalUrl(href: string): string | null {
@@ -665,14 +672,15 @@ function App() {
     setErrorBanner(null);
     try {
       const loaded = await invoke<SessionMeta[]>("list_sessions");
-      setSessions(loaded);
+      const sorted = sortSessionsByRecency(loaded);
+      setSessions(sorted);
       const active =
-        nextActiveId && loaded.some((s) => s.id === nextActiveId)
+        nextActiveId && sorted.some((s) => s.id === nextActiveId)
           ? nextActiveId
-          : loaded[0]?.id ?? "";
+          : sorted[0]?.id ?? "";
       setActiveSessionId(active);
       if (active) {
-        const s = loaded.find((x) => x.id === active);
+        const s = sorted.find((x) => x.id === active);
         if (s) await loadSession(s);
       }
     } catch (e) {
@@ -732,10 +740,11 @@ function App() {
   useEffect(() => {
     void invoke<SessionMeta[]>("list_sessions")
       .then((loaded) => {
-        setSessions(loaded);
+        const sorted = sortSessionsByRecency(loaded);
+        setSessions(sorted);
         if (loaded.length > 0) {
-          setActiveSessionId(loaded[0].id);
-          void loadSession(loaded[0]);
+          setActiveSessionId(sorted[0].id);
+          void loadSession(sorted[0]);
         }
       })
       .catch(() => {});
@@ -761,6 +770,7 @@ function App() {
     if (startingSessionId) return;
     const prevActiveSessionId = activeSessionId;
     const sessionId = newSessionId();
+    const now = Date.now();
 
     stickToBottomRef.current = true;
     setStartingSessionId(sessionId);
@@ -771,7 +781,8 @@ function App() {
     const placeholder: SessionMeta = {
       id: sessionId,
       title: safeSessionTitle(promptText),
-      created_at_ms: Date.now(),
+      created_at_ms: now,
+      last_used_at_ms: now,
       cwd: nextCwd,
       status: "running",
       codex_session_id: null,
@@ -790,7 +801,7 @@ function App() {
         prompt: promptText,
         cwd: nextCwd,
       });
-      setSessions((prev) => prev.map((s) => (s.id === sessionId ? meta : s)));
+      setSessions((prev) => sortSessionsByRecency(prev.map((s) => (s.id === sessionId ? meta : s))));
       setActiveSessionId(sessionId);
       if (meta.status !== "running") {
         void loadSession(meta);
@@ -842,10 +853,27 @@ function App() {
         prompt: promptText,
         cwd: cwd.trim() ? cwd.trim() : null,
       });
-      setSessions((prev) => prev.map((s) => (s.id === meta.id ? meta : s)));
+      setSessions((prev) => sortSessionsByRecency(prev.map((s) => (s.id === meta.id ? meta : s))));
       setActiveSessionId(meta.id);
     } catch (e) {
       setErrorBanner(String(e));
+    }
+  }
+
+  async function touchSession(sessionId: string) {
+    try {
+      const meta = await invoke<SessionMeta>("touch_session", { sessionId });
+      setSessions((prev) => {
+        let found = false;
+        const next = prev.map((s) => {
+          if (s.id !== meta.id) return s;
+          found = true;
+          return meta;
+        });
+        return sortSessionsByRecency(found ? next : [meta, ...next]);
+      });
+    } catch {
+      // ignore
     }
   }
 
@@ -992,6 +1020,7 @@ function App() {
               className={`sessionRow ${s.id === activeSessionId ? "active" : ""}`}
               onClick={() => {
                 persistScrollStateForActiveSession();
+                void touchSession(s.id);
                 setActiveSessionId(s.id);
                 void loadSession(s);
               }}
