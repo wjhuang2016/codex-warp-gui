@@ -21,6 +21,6 @@ npm run tauri dev
 npm run tauri build
 ```
 
-Output: `src-tauri/target/release/bundle/macos/Codex Warp.app`
-
-Note: DMG bundling is currently disabled in `src-tauri/tauri.conf.json` (see bd issue for follow-up).
+Outputs:
+- `src-tauri/target/release/bundle/macos/Codex Warp.app`
+- `src-tauri/target/release/bundle/dmg/Codex Warp_<version>_<arch>.dmg`
