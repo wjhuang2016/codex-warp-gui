@@ -2,7 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -70,6 +70,109 @@ type Block = {
   status?: string;
   collapsed?: boolean;
 };
+
+type TimelineProps = {
+  activeSessionId: string;
+  filteredBlocks: Block[];
+  startingSessionId: string | null;
+  loadingSessionId: string | null;
+  timelineRef: React.RefObject<HTMLDivElement | null>;
+  timelineEndRef: React.RefObject<HTMLDivElement | null>;
+  onTimelineScroll: () => void;
+  setCollapsedForActiveSession: (blockKey: string, collapsed: boolean) => void;
+  markdownComponents: Components;
+};
+
+const Timeline = memo(function Timeline({
+  activeSessionId,
+  filteredBlocks,
+  startingSessionId,
+  loadingSessionId,
+  timelineRef,
+  timelineEndRef,
+  onTimelineScroll,
+  setCollapsedForActiveSession,
+  markdownComponents,
+}: TimelineProps) {
+  return (
+    <div className="timeline" ref={timelineRef} onScroll={onTimelineScroll}>
+      <div className="timelineInner">
+        {startingSessionId === activeSessionId ? (
+          <div className="emptyState">
+            <div className="emptyTitle">Starting…</div>
+            <div className="muted">Launching a fresh Codex session.</div>
+          </div>
+        ) : loadingSessionId === activeSessionId ? (
+          <div className="emptyState">
+            <div className="emptyTitle">Loading…</div>
+            <div className="muted">Reading session logs from disk.</div>
+          </div>
+        ) : filteredBlocks.length === 0 ? (
+          <div className="emptyState">
+            <div className="emptyTitle">No output yet.</div>
+            <div className="muted">
+              Run a session, or clear filters/search if you expect content here.
+            </div>
+          </div>
+        ) : (
+          filteredBlocks.map((b) => {
+            const subtitle =
+              b.subtitle ?? (b.collapsed ? previewText(b.body) || undefined : undefined);
+            return (
+              <section key={b.id} className={`block ${b.kind}`}>
+                <header className="blockHeader">
+                  <div className="blockHeaderLeft">
+                    <div className="blockTitle">{b.title}</div>
+                    {subtitle ? <div className="blockSubtitle muted mono">{subtitle}</div> : null}
+                  </div>
+                  <div className="blockHeaderRight">
+                    {b.status ? <span className={`pill ${b.status}`}>{b.status}</span> : null}
+                    <button
+                      className="iconBtn blockToggle"
+                      type="button"
+                      onClick={() =>
+                        setCollapsedForActiveSession(b.key, !(b.collapsed ?? false))
+                      }
+                      aria-label={b.collapsed ? "Expand block" : "Collapse block"}
+                      title={b.collapsed ? "Expand" : "Collapse"}
+                    >
+                      {b.collapsed ? "▸" : "▾"}
+                    </button>
+                    <div className="muted mono blockTime">
+                      {new Date(b.ts_ms).toLocaleTimeString()}
+                    </div>
+                  </div>
+                </header>
+                {b.collapsed ? null : (
+                  <div className="blockBody">
+                    {b.kind === "assistant" ? (
+                      <div className="markdown compact">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                          {b.body}
+                        </ReactMarkdown>
+                      </div>
+                    ) : b.kind === "thought" ? (
+                      <div className="markdown compact thoughtMarkdown">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                          {b.body}
+                        </ReactMarkdown>
+                      </div>
+                    ) : b.kind === "command" ? (
+                      <CodeFrame text={b.body || "(no output yet)"} />
+                    ) : (
+                      <pre className="blockPre mono">{b.body}</pre>
+                    )}
+                  </div>
+                )}
+              </section>
+            );
+          })
+        )}
+        <div className="timelineEnd" ref={timelineEndRef} />
+      </div>
+    </div>
+  );
+});
 
 function newId(): string {
   if ("crypto" in window && "randomUUID" in crypto) return crypto.randomUUID();
@@ -891,14 +994,17 @@ function App() {
     }
   }, [activeSessionId, scrollTimelineToBottom]);
 
-  function setCollapsedForActiveSession(blockKey: string, collapsed: boolean) {
-    if (!activeSessionId) return;
-    setBlocksBySession((prev) => {
-      const list = prev[activeSessionId] ?? [];
-      const nextList = list.map((b) => (b.key === blockKey ? { ...b, collapsed } : b));
-      return { ...prev, [activeSessionId]: nextList };
-    });
-  }
+  const setCollapsedForActiveSession = useCallback(
+    (blockKey: string, collapsed: boolean) => {
+      if (!activeSessionId) return;
+      setBlocksBySession((prev) => {
+        const list = prev[activeSessionId] ?? [];
+        const nextList = list.map((b) => (b.key === blockKey ? { ...b, collapsed } : b));
+        return { ...prev, [activeSessionId]: nextList };
+      });
+    },
+    [activeSessionId],
+  );
 
   async function loadSession(session: SessionMeta) {
     const loadId = session.id;
@@ -1453,102 +1559,37 @@ function App() {
           </div>
 	        </div>
 	
-	        {activeSession?.status === "running" ? (
-	          <div className="runBanner">
-	            <div className="runBannerLine">
-	              <span className="runBullet" aria-hidden>
-	                •
-	              </span>
-	              <span className="runBannerTitle">{runHeadline || "Running…"}</span>
-	              <span className="runBannerMeta muted mono">
-	                (
-	                {runElapsedSec != null ? `${runElapsedSec}s • ` : ""}
-	                {contextLeftPct != null ? `${contextLeftPct}% context left • ` : ""}
-	                esc to interrupt)
-	              </span>
-	            </div>
-	          </div>
-	        ) : null}
+		        {activeSession?.status === "running" ? (
+		          <div className="runBanner">
+		            <div className="runBannerLine">
+		              <span className="runBullet" aria-hidden>
+		                •
+		              </span>
+		              <span className="runBannerTitle">{runHeadline || "Running…"}</span>
+		              <span className="runBannerMeta muted mono">
+		                (
+		                {runElapsedSec != null ? `${runElapsedSec}s • ` : ""}
+		                {contextLeftPct != null ? `${contextLeftPct}% context left • ` : ""}
+		                esc to interrupt)
+		              </span>
+		            </div>
+		          </div>
+		        ) : null}
 
-	        <div className="timeline" ref={timelineRef} onScroll={onTimelineScroll}>
-          <div className="timelineInner">
-            {startingSessionId === activeSessionId ? (
-              <div className="emptyState">
-                <div className="emptyTitle">Starting…</div>
-                <div className="muted">Launching a fresh Codex session.</div>
-              </div>
-            ) : loadingSessionId === activeSessionId ? (
-              <div className="emptyState">
-                <div className="emptyTitle">Loading…</div>
-                <div className="muted">Reading session logs from disk.</div>
-              </div>
-            ) : filteredBlocks.length === 0 ? (
-              <div className="emptyState">
-                <div className="emptyTitle">No output yet.</div>
-                <div className="muted">
-                  Run a session, or clear filters/search if you expect content here.
-                </div>
-              </div>
-            ) : (
-              filteredBlocks.map((b) => {
-                const subtitle =
-                  b.subtitle ?? (b.collapsed ? previewText(b.body) || undefined : undefined);
-                return (
-                  <section key={b.id} className={`block ${b.kind}`}>
-                    <header className="blockHeader">
-                      <div className="blockHeaderLeft">
-                        <div className="blockTitle">{b.title}</div>
-                        {subtitle ? <div className="blockSubtitle muted mono">{subtitle}</div> : null}
-                      </div>
-                      <div className="blockHeaderRight">
-                        {b.status ? <span className={`pill ${b.status}`}>{b.status}</span> : null}
-                        <button
-                          className="iconBtn blockToggle"
-                          type="button"
-                          onClick={() =>
-                            setCollapsedForActiveSession(b.key, !(b.collapsed ?? false))
-                          }
-                          aria-label={b.collapsed ? "Expand block" : "Collapse block"}
-                          title={b.collapsed ? "Expand" : "Collapse"}
-                        >
-                          {b.collapsed ? "▸" : "▾"}
-                        </button>
-                        <div className="muted mono blockTime">
-                          {new Date(b.ts_ms).toLocaleTimeString()}
-                        </div>
-                      </div>
-                    </header>
-                    {b.collapsed ? null : (
-                      <div className="blockBody">
-	                      {b.kind === "assistant" ? (
-	                        <div className="markdown compact">
-	                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-	                            {b.body}
-	                          </ReactMarkdown>
-	                        </div>
-	                      ) : b.kind === "thought" ? (
-	                        <div className="markdown compact thoughtMarkdown">
-	                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-	                            {b.body}
-	                          </ReactMarkdown>
-	                        </div>
-	                      ) : b.kind === "command" ? (
-	                        <CodeFrame text={b.body || "(no output yet)"} />
-	                      ) : (
-	                          <pre className="blockPre mono">{b.body}</pre>
-	                        )}
-                      </div>
-                    )}
-                  </section>
-                );
-              })
-            )}
-            <div className="timelineEnd" ref={timelineEndRef} />
-          </div>
-        </div>
+	        <Timeline
+	          activeSessionId={activeSessionId}
+	          filteredBlocks={filteredBlocks}
+	          startingSessionId={startingSessionId}
+	          loadingSessionId={loadingSessionId}
+	          timelineRef={timelineRef}
+	          timelineEndRef={timelineEndRef}
+	          onTimelineScroll={onTimelineScroll}
+	          setCollapsedForActiveSession={setCollapsedForActiveSession}
+	          markdownComponents={markdownComponents}
+	        />
 
-        <div className="composer">
-          <div className="composerLeft">
+	        <div className="composer">
+	          <div className="composerLeft">
             <textarea
               className="prompt"
               value={prompt}
