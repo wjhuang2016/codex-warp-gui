@@ -17,6 +17,7 @@ use tokio::{
 use uuid::Uuid;
 
 const SHELL_CWD_MARKER: &[u8] = b"__CODEX_CWD__=";
+const CONTEXT_METRICS_EMIT_MIN_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Clone, Serialize)]
 struct UiEvent {
@@ -152,7 +153,11 @@ fn escape_single_quotes(s: &str) -> String {
 fn choose_initial_cwd(settings: &Settings, requested: Option<String>) -> Option<String> {
     let mut cwd = requested.and_then(|s| {
         let t = s.trim().to_string();
-        if t.is_empty() { None } else { Some(t) }
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
     });
     if cwd.is_none() {
         if let Some(path) = settings.last_cwd.clone().or(settings.default_cwd.clone()) {
@@ -250,14 +255,24 @@ fn stream_shell_output(
                 match std::str::from_utf8(&merged) {
                     Ok(s) => {
                         utf8_carry.clear();
-                        let _ = app.emit("shell_output", ShellOutput { data: s.to_string() });
+                        let _ = app.emit(
+                            "shell_output",
+                            ShellOutput {
+                                data: s.to_string(),
+                            },
+                        );
                     }
                     Err(e) => {
                         let valid = e.valid_up_to();
                         let (good, rest) = merged.split_at(valid);
                         if !good.is_empty() {
                             let s = unsafe { std::str::from_utf8_unchecked(good) };
-                            let _ = app.emit("shell_output", ShellOutput { data: s.to_string() });
+                            let _ = app.emit(
+                                "shell_output",
+                                ShellOutput {
+                                    data: s.to_string(),
+                                },
+                            );
                         }
                         utf8_carry.clear();
                         utf8_carry.extend_from_slice(rest);
@@ -268,14 +283,24 @@ fn stream_shell_output(
 
             match std::str::from_utf8(&out) {
                 Ok(s) => {
-                    let _ = app.emit("shell_output", ShellOutput { data: s.to_string() });
+                    let _ = app.emit(
+                        "shell_output",
+                        ShellOutput {
+                            data: s.to_string(),
+                        },
+                    );
                 }
                 Err(e) => {
                     let valid = e.valid_up_to();
                     let (good, rest) = out.split_at(valid);
                     if !good.is_empty() {
                         let s = unsafe { std::str::from_utf8_unchecked(good) };
-                        let _ = app.emit("shell_output", ShellOutput { data: s.to_string() });
+                        let _ = app.emit(
+                            "shell_output",
+                            ShellOutput {
+                                data: s.to_string(),
+                            },
+                        );
                     }
                     utf8_carry.extend_from_slice(rest);
                 }
@@ -652,7 +677,10 @@ fn capture_agent_message_text(
         let Some(item_id) = params.get("itemId").and_then(|v| v.as_str()) else {
             return;
         };
-        let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or_default();
+        let delta = params
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if agent_item_id.as_deref() != Some(item_id) {
             agent_text.clear();
             *agent_item_id = Some(item_id.to_string());
@@ -713,12 +741,14 @@ fn extract_token_usage_snapshot(msg: &serde_json::Value) -> Option<TokenUsageSna
         .and_then(|t| t.get("totalTokens"))
         .and_then(json_u64)
         .or_else(|| {
-            usage.get("last")
+            usage
+                .get("last")
                 .and_then(|t| t.get("totalTokens"))
                 .and_then(json_u64)
         })
         .or_else(|| {
-            usage.get("total")
+            usage
+                .get("total")
                 .and_then(|t| t.get("inputTokens"))
                 .and_then(json_u64)
         })
@@ -1250,16 +1280,14 @@ async fn run_turn_via_app_server(
     )
     .await
     {
-        Ok(result) => {
-            result
-                .get("turn")
-                .and_then(|v| v.get("id"))
-                .and_then(|v| match v {
-                    serde_json::Value::String(s) => Some(s.to_string()),
-                    serde_json::Value::Number(n) => n.as_i64().map(|i| i.to_string()),
-                    _ => None,
-                })
-        }
+        Ok(result) => result
+            .get("turn")
+            .and_then(|v| v.get("id"))
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.to_string()),
+                serde_json::Value::Number(n) => n.as_i64().map(|i| i.to_string()),
+                _ => None,
+            }),
         Err(e) => {
             let _ = child.kill().await;
             let (exit_code, error) = if e == "cancelled" {
@@ -1308,7 +1336,10 @@ async fn run_turn_via_app_server(
             if let Some(snapshot) = extract_token_usage_snapshot(&json) {
                 if last_metrics_emitted_pct != Some(snapshot.pct_left) {
                     let now = now_ms();
-                    if last_metrics_emit_ms == 0 || now.saturating_sub(last_metrics_emit_ms) >= 1000 {
+                    if last_metrics_emit_ms == 0
+                        || now.saturating_sub(last_metrics_emit_ms)
+                            >= CONTEXT_METRICS_EMIT_MIN_INTERVAL_MS
+                    {
                         persist_context_metrics(&meta_path, snapshot).await;
                         let _ = app.emit(
                             "codex_metrics",
@@ -1330,8 +1361,8 @@ async fn run_turn_via_app_server(
             }
         }
 
-        let _ = persist_and_emit_stdout(&app, &session_id, &mut events_file, &raw, json.clone())
-            .await;
+        let _ =
+            persist_and_emit_stdout(&app, &session_id, &mut events_file, &raw, json.clone()).await;
         capture_agent_message_text(&json, &mut agent_item_id, &mut agent_text);
 
         if method == "turn/completed" {
@@ -1355,9 +1386,10 @@ async fn run_turn_via_app_server(
 
     if cancelled {
         exit_code = None;
-        if let (Some(thread_id), Some(turn_id)) =
-            (effective_thread_id.as_deref(), turn_id_for_interrupt.as_deref())
-        {
+        if let (Some(thread_id), Some(turn_id)) = (
+            effective_thread_id.as_deref(),
+            turn_id_for_interrupt.as_deref(),
+        ) {
             let interrupt_id = next_id;
             let _ = write_jsonrpc_request(
                 &mut stdin,
@@ -1509,21 +1541,21 @@ async fn start_run(
             )
             .await;
 
-	            let meta = SessionMeta {
-	                id: session_id.clone(),
-	                title: safe_title(&prompt),
-	                created_at_ms,
-	                last_used_at_ms,
-	                cwd: cwd.clone(),
-	                status: SessionStatus::Error,
-	                codex_session_id: None,
-	                context_window: None,
-	                context_used_tokens: None,
-	                context_left_pct: None,
-	                events_path: events_path.to_string_lossy().to_string(),
-	                stderr_path: stderr_path.to_string_lossy().to_string(),
-	                conclusion_path: conclusion_path.to_string_lossy().to_string(),
-	            };
+            let meta = SessionMeta {
+                id: session_id.clone(),
+                title: safe_title(&prompt),
+                created_at_ms,
+                last_used_at_ms,
+                cwd: cwd.clone(),
+                status: SessionStatus::Error,
+                codex_session_id: None,
+                context_window: None,
+                context_used_tokens: None,
+                context_left_pct: None,
+                events_path: events_path.to_string_lossy().to_string(),
+                stderr_path: stderr_path.to_string_lossy().to_string(),
+                conclusion_path: conclusion_path.to_string_lossy().to_string(),
+            };
 
             let meta_path = dir.join("meta.json");
             let _ = tokio::fs::write(
@@ -1588,21 +1620,21 @@ async fn start_run(
         );
     }
 
-	    let meta = SessionMeta {
-	        id: session_id.clone(),
-	        title: safe_title(&prompt),
-	        created_at_ms,
-	        last_used_at_ms,
-	        cwd: cwd.clone(),
-	        status: SessionStatus::Running,
-	        codex_session_id: None,
-	        context_window: None,
-	        context_used_tokens: None,
-	        context_left_pct: None,
-	        events_path: events_path.to_string_lossy().to_string(),
-	        stderr_path: stderr_path.to_string_lossy().to_string(),
-	        conclusion_path: conclusion_path.to_string_lossy().to_string(),
-	    };
+    let meta = SessionMeta {
+        id: session_id.clone(),
+        title: safe_title(&prompt),
+        created_at_ms,
+        last_used_at_ms,
+        cwd: cwd.clone(),
+        status: SessionStatus::Running,
+        codex_session_id: None,
+        context_window: None,
+        context_used_tokens: None,
+        context_left_pct: None,
+        events_path: events_path.to_string_lossy().to_string(),
+        stderr_path: stderr_path.to_string_lossy().to_string(),
+        conclusion_path: conclusion_path.to_string_lossy().to_string(),
+    };
 
     let meta_path = dir.join("meta.json");
     tokio::fs::write(
@@ -2026,10 +2058,7 @@ RPROMPT=''
         if let Some(dir) = initial_cwd_for_spawn.clone() {
             cmd.cwd(dir);
         }
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| e.to_string())?;
+        let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
 
         let master_box = pair.master;
         let writer = master_box.take_writer().map_err(|e| e.to_string())?;
