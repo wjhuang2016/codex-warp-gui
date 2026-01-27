@@ -91,6 +91,14 @@ function safeSessionTitle(prompt: string): string {
   return `${s.slice(0, 60)}…`;
 }
 
+function clampTitle(text: string, max = 70): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  const s = trimmed.replace(/\s+/g, " ");
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}…`;
+}
+
 function sortSessionsByRecency(items: SessionMeta[]): SessionMeta[] {
   return items
     .slice()
@@ -636,6 +644,9 @@ function App() {
   const [showRename, setShowRename] = useState(false);
   const [renameDraft, setRenameDraft] = useState("");
   const [renameSaving, setRenameSaving] = useState(false);
+  const [runStartedAtBySession, setRunStartedAtBySession] = useState<Record<string, number>>({});
+  const [lastPromptBySession, setLastPromptBySession] = useState<Record<string, string>>({});
+  const [tickerMs, setTickerMs] = useState(() => Date.now());
 
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
@@ -695,10 +706,6 @@ function App() {
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
-      const target = e.target as HTMLElement | null;
-      if (target && target.closest(".cwdShell")) {
-        return;
-      }
       if (showSettingsRef.current) {
         e.preventDefault();
         setShowSettings(false);
@@ -721,11 +728,40 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  useEffect(() => {
+    if (activeSession?.status !== "running") return;
+    const id = window.setInterval(() => setTickerMs(Date.now()), 250);
+    return () => window.clearInterval(id);
+  }, [activeSession?.status, activeSessionId]);
+
   const todos = useMemo(() => extractTodos(blocks), [blocks]);
   const conclusion = useMemo(
     () => conclusionBySession[activeSessionId] ?? "",
     [activeSessionId, conclusionBySession],
   );
+
+  const runElapsedSec = useMemo(() => {
+    if (!activeSessionId) return null;
+    if (activeSession?.status !== "running") return null;
+    const started =
+      runStartedAtBySession[activeSessionId] ?? activeSession?.last_used_at_ms ?? 0;
+    if (!started) return null;
+    return Math.max(0, Math.floor((tickerMs - started) / 1000));
+  }, [
+    activeSession?.last_used_at_ms,
+    activeSession?.status,
+    activeSessionId,
+    runStartedAtBySession,
+    tickerMs,
+  ]);
+
+  const runHeadline = useMemo(() => {
+    if (!activeSessionId) return "";
+    const p = lastPromptBySession[activeSessionId];
+    if (p && p.trim()) return clampTitle(p, 84);
+    if (activeSession?.title) return clampTitle(activeSession.title, 84);
+    return "";
+  }, [activeSession?.title, activeSessionId, lastPromptBySession]);
 
   const filteredBlocks = useMemo(() => {
     const kind = blockKindFilter;
@@ -848,6 +884,17 @@ function App() {
         };
       });
 
+      let lastPrompt = "";
+      for (const evt of events) {
+        if (!isObject(evt.json)) continue;
+        if ((evt.json as any).type === "app.prompt" && typeof (evt.json as any).prompt === "string") {
+          lastPrompt = String((evt.json as any).prompt);
+        }
+      }
+      if (lastPrompt.trim()) {
+        setLastPromptBySession((prev) => ({ ...prev, [session.id]: lastPrompt }));
+      }
+
       const stderrEvents: UiEvent[] = stderrLines.map((raw, idx) => ({
         session_id: session.id,
         ts_ms: session.created_at_ms + lines.length + idx,
@@ -918,6 +965,12 @@ function App() {
           s.id === payload.session_id ? { ...s, status: payload.success ? "done" : "error" } : s,
         ),
       );
+      setRunStartedAtBySession((prev) => {
+        if (!(payload.session_id in prev)) return prev;
+        const next = { ...prev };
+        delete next[payload.session_id];
+        return next;
+      });
 
       if (!payload.success && payload.session_id === activeSessionIdRef.current) {
         const msg =
@@ -983,6 +1036,8 @@ function App() {
     const now = Date.now();
 
     stickToBottomRef.current = true;
+    setRunStartedAtBySession((prev) => ({ ...prev, [sessionId]: now }));
+    setLastPromptBySession((prev) => ({ ...prev, [sessionId]: promptText }));
     setStartingSessionId(sessionId);
     setActiveSessionId(sessionId);
     setErrorBanner(null);
@@ -1017,6 +1072,12 @@ function App() {
         void loadSession(meta);
       }
     } catch (e) {
+      setRunStartedAtBySession((prev) => {
+        if (!(sessionId in prev)) return prev;
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
       setSessions((prev) => prev.filter((s) => s.id !== sessionId));
       setBlocksBySession((prev) => {
         const next = { ...prev };
@@ -1058,6 +1119,16 @@ function App() {
     }
 
     try {
+      const now = Date.now();
+      setRunStartedAtBySession((prev) => ({ ...prev, [activeSessionId]: now }));
+      setLastPromptBySession((prev) => ({ ...prev, [activeSessionId]: promptText }));
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === activeSessionId
+            ? { ...s, status: "running", last_used_at_ms: Math.max(s.last_used_at_ms, now) }
+            : s,
+        ),
+      );
       const meta = await invoke<SessionMeta>("continue_run", {
         sessionId: activeSessionId,
         prompt: promptText,
@@ -1066,6 +1137,12 @@ function App() {
       setSessions((prev) => sortSessionsByRecency(prev.map((s) => (s.id === meta.id ? meta : s))));
       setActiveSessionId(meta.id);
     } catch (e) {
+      setRunStartedAtBySession((prev) => {
+        if (!(activeSessionId in prev)) return prev;
+        const next = { ...prev };
+        delete next[activeSessionId];
+        return next;
+      });
       setErrorBanner(String(e));
     }
   }
@@ -1248,7 +1325,7 @@ function App() {
 
       <main className="main">
         {errorBanner ? <div className="errorBanner">{errorBanner}</div> : null}
-        <div className="filterBar">
+	        <div className="filterBar">
           <input
             className="search"
             value={blockQuery}
@@ -1292,9 +1369,25 @@ function App() {
           <div className="muted mono results">
             {filteredBlocks.length}/{blocks.length}
           </div>
-        </div>
+	        </div>
+	
+	        {activeSession?.status === "running" ? (
+	          <div className="runBanner">
+	            <div className="runBannerLine">
+	              <span className="runBullet" aria-hidden>
+	                •
+	              </span>
+	              <span className="runBannerTitle">{runHeadline || "Running…"}</span>
+	              <span className="runBannerMeta muted mono">
+	                (
+	                {runElapsedSec != null ? `${runElapsedSec}s • ` : ""}
+	                esc to interrupt)
+	              </span>
+	            </div>
+	          </div>
+	        ) : null}
 
-        <div className="timeline" ref={timelineRef} onScroll={onTimelineScroll}>
+	        <div className="timeline" ref={timelineRef} onScroll={onTimelineScroll}>
           <div className="timelineInner">
             {startingSessionId === activeSessionId ? (
               <div className="emptyState">

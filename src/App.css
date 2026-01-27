@@ -172,6 +172,38 @@ body {
   min-width: 0;
 }
 
+.runBanner {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(17, 23, 42, 0.18);
+}
+
+.runBannerLine {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.runBullet {
+  color: rgba(0, 212, 255, 0.9);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.runBannerTitle {
+  font-weight: 800;
+  font-size: 14px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runBannerMeta {
+  flex-shrink: 0;
+}
+
 .search {
   flex: 1;
   min-width: 0;
