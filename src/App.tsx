@@ -27,6 +27,9 @@ type SessionMeta = {
   cwd?: string | null;
   status: SessionStatus;
   codex_session_id?: string | null;
+  context_window?: number | null;
+  context_used_tokens?: number | null;
+  context_left_pct?: number | null;
   events_path: string;
   stderr_path: string;
   conclusion_path: string;
@@ -38,6 +41,14 @@ type UiEvent = {
   stream: "stdout" | "stderr";
   raw: string;
   json: unknown | null;
+};
+
+type ContextMetrics = {
+  session_id: string;
+  ts_ms: number;
+  context_left_pct: number;
+  context_used_tokens: number;
+  context_window: number;
 };
 
 type RunFinished = {
@@ -648,6 +659,7 @@ function App() {
   const [startingSessionId, setStartingSessionId] = useState<string | null>(null);
   const [blocksBySession, setBlocksBySession] = useState<Record<string, Block[]>>({});
   const [conclusionBySession, setConclusionBySession] = useState<Record<string, string>>({});
+  const [metricsBySession, setMetricsBySession] = useState<Record<string, ContextMetrics>>({});
   const [prompt, setPrompt] = useState("");
   const [cwd, setCwd] = useState("");
   const [blockQuery, setBlockQuery] = useState("");
@@ -780,6 +792,14 @@ function App() {
     runStartedAtBySession,
     tickerMs,
   ]);
+
+  const contextLeftPct = useMemo(() => {
+    if (!activeSessionId) return null;
+    const live = metricsBySession[activeSessionId]?.context_left_pct;
+    if (typeof live === "number") return live;
+    const persisted = activeSession?.context_left_pct;
+    return typeof persisted === "number" ? persisted : null;
+  }, [activeSession?.context_left_pct, activeSessionId, metricsBySession]);
 
   const runHeadline = useMemo(() => {
     if (!activeSessionId) return "";
@@ -970,6 +990,7 @@ function App() {
     let disposed = false;
     let unlistenEvent: (() => void) | null = null;
     let unlistenFinished: (() => void) | null = null;
+    let unlistenMetrics: (() => void) | null = null;
 
     void listen<UiEvent>("codex_event", ({ payload }) => {
       if (!payload?.session_id) return;
@@ -981,6 +1002,28 @@ function App() {
       .then((unlisten) => {
         if (disposed) unlisten();
         else unlistenEvent = unlisten;
+      })
+      .catch(() => {});
+
+    void listen<ContextMetrics>("codex_metrics", ({ payload }) => {
+      if (!payload?.session_id) return;
+      setMetricsBySession((prev) => ({ ...prev, [payload.session_id]: payload }));
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === payload.session_id
+            ? {
+                ...s,
+                context_left_pct: payload.context_left_pct,
+                context_used_tokens: payload.context_used_tokens,
+                context_window: payload.context_window,
+              }
+            : s,
+        ),
+      );
+    })
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else unlistenMetrics = unlisten;
       })
       .catch(() => {});
 
@@ -1023,6 +1066,7 @@ function App() {
       disposed = true;
       unlistenEvent?.();
       unlistenFinished?.();
+      unlistenMetrics?.();
     };
   }, []);
 
@@ -1419,6 +1463,7 @@ function App() {
 	              <span className="runBannerMeta muted mono">
 	                (
 	                {runElapsedSec != null ? `${runElapsedSec}s • ` : ""}
+	                {contextLeftPct != null ? `${contextLeftPct}% context left • ` : ""}
 	                esc to interrupt)
 	              </span>
 	            </div>

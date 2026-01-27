@@ -63,9 +63,24 @@ struct SessionMeta {
     cwd: Option<String>,
     status: SessionStatus,
     codex_session_id: Option<String>,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    context_used_tokens: Option<u64>,
+    #[serde(default)]
+    context_left_pct: Option<u8>,
     events_path: String,
     stderr_path: String,
     conclusion_path: String,
+}
+
+#[derive(Clone, Serialize)]
+struct ContextMetrics {
+    session_id: String,
+    ts_ms: u64,
+    context_left_pct: u8,
+    context_used_tokens: u64,
+    context_window: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -667,6 +682,69 @@ fn capture_agent_message_text(
     }
 }
 
+#[derive(Clone, Copy)]
+struct TokenUsageSnapshot {
+    window: u64,
+    used: u64,
+    pct_left: u8,
+}
+
+fn json_u64(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn extract_token_usage_snapshot(msg: &serde_json::Value) -> Option<TokenUsageSnapshot> {
+    if msg.get("method").and_then(|v| v.as_str()) != Some("thread/tokenUsage/updated") {
+        return None;
+    }
+    let params = msg.get("params")?;
+    let window = json_u64(params.get("modelContextWindow")?)?;
+    if window == 0 {
+        return None;
+    }
+    let usage = params.get("tokenUsage")?;
+
+    let used = usage
+        .get("total")
+        .and_then(|t| t.get("totalTokens"))
+        .and_then(json_u64)
+        .or_else(|| {
+            usage.get("last")
+                .and_then(|t| t.get("totalTokens"))
+                .and_then(json_u64)
+        })
+        .or_else(|| {
+            usage.get("total")
+                .and_then(|t| t.get("inputTokens"))
+                .and_then(json_u64)
+        })
+        .unwrap_or(0);
+
+    let remaining = window.saturating_sub(used);
+    // Round to nearest integer to avoid jitter.
+    let pct_left = ((remaining.saturating_mul(100) + (window / 2)) / window).min(100) as u8;
+
+    Some(TokenUsageSnapshot {
+        window,
+        used,
+        pct_left,
+    })
+}
+
+async fn persist_context_metrics(meta_path: &Path, snapshot: TokenUsageSnapshot) {
+    let Some(mut meta) = read_meta(meta_path).await else {
+        return;
+    };
+    meta.context_window = Some(snapshot.window);
+    meta.context_used_tokens = Some(snapshot.used);
+    meta.context_left_pct = Some(snapshot.pct_left);
+    let _ = write_meta(meta_path, &meta).await;
+}
+
 async fn wait_for_app_server_response(
     lines: &mut tokio::io::Lines<BufReader<ChildStdout>>,
     cancel_rx: &mut oneshot::Receiver<()>,
@@ -1207,6 +1285,9 @@ async fn run_turn_via_app_server(
     let mut cancelled = false;
     let mut success = false;
     let mut exit_code: Option<i32> = Some(1);
+    let mut last_metrics_emit_ms: u64 = 0;
+    let mut last_metrics_emitted_pct: Option<u8> = None;
+    let mut pending_metrics: Option<TokenUsageSnapshot> = None;
 
     loop {
         let next = read_next_json_line(&mut lines, &mut cancel_rx).await;
@@ -1222,6 +1303,33 @@ async fn run_turn_via_app_server(
         let Some(method) = json.get("method").and_then(|v| v.as_str()) else {
             continue;
         };
+
+        if method == "thread/tokenUsage/updated" {
+            if let Some(snapshot) = extract_token_usage_snapshot(&json) {
+                if last_metrics_emitted_pct != Some(snapshot.pct_left) {
+                    let now = now_ms();
+                    if last_metrics_emit_ms == 0 || now.saturating_sub(last_metrics_emit_ms) >= 1000 {
+                        persist_context_metrics(&meta_path, snapshot).await;
+                        let _ = app.emit(
+                            "codex_metrics",
+                            ContextMetrics {
+                                session_id: session_id.clone(),
+                                ts_ms: now,
+                                context_left_pct: snapshot.pct_left,
+                                context_used_tokens: snapshot.used,
+                                context_window: snapshot.window,
+                            },
+                        );
+                        last_metrics_emit_ms = now;
+                        last_metrics_emitted_pct = Some(snapshot.pct_left);
+                        pending_metrics = None;
+                    } else {
+                        pending_metrics = Some(snapshot);
+                    }
+                }
+            }
+        }
+
         let _ = persist_and_emit_stdout(&app, &session_id, &mut events_file, &raw, json.clone())
             .await;
         capture_agent_message_text(&json, &mut agent_item_id, &mut agent_text);
@@ -1260,6 +1368,23 @@ async fn run_turn_via_app_server(
             .await;
         }
         success = false;
+    }
+
+    if let Some(snapshot) = pending_metrics {
+        if last_metrics_emitted_pct != Some(snapshot.pct_left) {
+            let now = now_ms();
+            persist_context_metrics(&meta_path, snapshot).await;
+            let _ = app.emit(
+                "codex_metrics",
+                ContextMetrics {
+                    session_id: session_id.clone(),
+                    ts_ms: now,
+                    context_left_pct: snapshot.pct_left,
+                    context_used_tokens: snapshot.used,
+                    context_window: snapshot.window,
+                },
+            );
+        }
     }
 
     let cleaned_agent_text = strip_tool_citations(&agent_text);
@@ -1384,18 +1509,21 @@ async fn start_run(
             )
             .await;
 
-            let meta = SessionMeta {
-                id: session_id.clone(),
-                title: safe_title(&prompt),
-                created_at_ms,
-                last_used_at_ms,
-                cwd: cwd.clone(),
-                status: SessionStatus::Error,
-                codex_session_id: None,
-                events_path: events_path.to_string_lossy().to_string(),
-                stderr_path: stderr_path.to_string_lossy().to_string(),
-                conclusion_path: conclusion_path.to_string_lossy().to_string(),
-            };
+	            let meta = SessionMeta {
+	                id: session_id.clone(),
+	                title: safe_title(&prompt),
+	                created_at_ms,
+	                last_used_at_ms,
+	                cwd: cwd.clone(),
+	                status: SessionStatus::Error,
+	                codex_session_id: None,
+	                context_window: None,
+	                context_used_tokens: None,
+	                context_left_pct: None,
+	                events_path: events_path.to_string_lossy().to_string(),
+	                stderr_path: stderr_path.to_string_lossy().to_string(),
+	                conclusion_path: conclusion_path.to_string_lossy().to_string(),
+	            };
 
             let meta_path = dir.join("meta.json");
             let _ = tokio::fs::write(
@@ -1460,18 +1588,21 @@ async fn start_run(
         );
     }
 
-    let meta = SessionMeta {
-        id: session_id.clone(),
-        title: safe_title(&prompt),
-        created_at_ms,
-        last_used_at_ms,
-        cwd: cwd.clone(),
-        status: SessionStatus::Running,
-        codex_session_id: None,
-        events_path: events_path.to_string_lossy().to_string(),
-        stderr_path: stderr_path.to_string_lossy().to_string(),
-        conclusion_path: conclusion_path.to_string_lossy().to_string(),
-    };
+	    let meta = SessionMeta {
+	        id: session_id.clone(),
+	        title: safe_title(&prompt),
+	        created_at_ms,
+	        last_used_at_ms,
+	        cwd: cwd.clone(),
+	        status: SessionStatus::Running,
+	        codex_session_id: None,
+	        context_window: None,
+	        context_used_tokens: None,
+	        context_left_pct: None,
+	        events_path: events_path.to_string_lossy().to_string(),
+	        stderr_path: stderr_path.to_string_lossy().to_string(),
+	        conclusion_path: conclusion_path.to_string_lossy().to_string(),
+	    };
 
     let meta_path = dir.join("meta.json");
     tokio::fs::write(
