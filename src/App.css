@@ -672,6 +672,22 @@ body {
   padding: 0;
 }
 
+.block.thought .markdown.thoughtMarkdown {
+  background: var(--code-bg);
+  border-color: var(--code-border);
+}
+
+.block.thought .markdown.thoughtMarkdown > :first-child {
+  margin-top: 0;
+}
+
+.block.thought .markdown.thoughtMarkdown > p:first-child > strong:only-child {
+  display: block;
+  font-size: 15px;
+  font-weight: 900;
+  letter-spacing: 0.2px;
+}
+
 .detailsSummary {
   cursor: pointer;
   user-select: none;

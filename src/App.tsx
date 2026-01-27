@@ -1520,19 +1520,23 @@ function App() {
                     </header>
                     {b.collapsed ? null : (
                       <div className="blockBody">
-                      {b.kind === "assistant" ? (
-                        <div className="markdown compact">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                            {b.body}
-                          </ReactMarkdown>
-                        </div>
-                      ) : b.kind === "thought" ? (
-                        <pre className="blockPre mono">{b.body}</pre>
-                      ) : b.kind === "command" ? (
-                        <CodeFrame text={b.body || "(no output yet)"} />
-                      ) : (
-                          <pre className="blockPre mono">{b.body}</pre>
-                        )}
+	                      {b.kind === "assistant" ? (
+	                        <div className="markdown compact">
+	                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+	                            {b.body}
+	                          </ReactMarkdown>
+	                        </div>
+	                      ) : b.kind === "thought" ? (
+	                        <div className="markdown compact thoughtMarkdown">
+	                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+	                            {b.body}
+	                          </ReactMarkdown>
+	                        </div>
+	                      ) : b.kind === "command" ? (
+	                        <CodeFrame text={b.body || "(no output yet)"} />
+	                      ) : (
+	                          <pre className="blockPre mono">{b.body}</pre>
+	                        )}
                       </div>
                     )}
                   </section>
