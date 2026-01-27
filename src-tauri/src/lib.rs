@@ -2224,6 +2224,64 @@ async fn save_pasted_image(
     Ok(path.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+async fn import_dropped_files(
+    app: AppHandle,
+    session_id: Option<String>,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let base = match session_id.as_deref() {
+        Some(sid) if !sid.trim().is_empty() => session_dir(&app, sid)?,
+        _ => app.path().app_data_dir().map_err(|e| e.to_string())?,
+    };
+    let dir = base.join("attachments");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut out: Vec<String> = Vec::new();
+    for raw in paths {
+        let src = PathBuf::from(raw.trim());
+        if src.as_os_str().is_empty() {
+            continue;
+        }
+        let meta = tokio::fs::metadata(&src).await.map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            continue;
+        }
+
+        let name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "file".to_string());
+        let name = name.trim();
+        let safe = if name.is_empty() {
+            "file".to_string()
+        } else {
+            name.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(120)
+                .collect::<String>()
+        };
+
+        let filename = format!("drop-{}-{}-{}", now_ms(), Uuid::new_v4(), safe);
+        let dst = dir.join(filename);
+        let _ = tokio::fs::copy(&src, &dst)
+            .await
+            .map_err(|e| e.to_string())?;
+        out.push(dst.to_string_lossy().to_string());
+    }
+
+    Ok(out)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2249,7 +2307,8 @@ pub fn run() {
             shell_resize,
             shell_cd,
             stop_shell,
-            save_pasted_image
+            save_pasted_image,
+            import_dropped_files
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

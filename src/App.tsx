@@ -884,18 +884,33 @@ function App() {
     showRenameRef.current = showRename;
   }, [activeSession?.status, activeSessionId, showRename, showSettings, showSessionSettings]);
 
-  useEffect(() => {
-    let unlisten: null | (() => void) = null;
-    void getCurrentWindow()
-      .onDragDropEvent((event) => {
-        const payload: DragDropEvent = event.payload;
-        if (payload.type !== "drop") return;
-        if (!payload.paths?.length) return;
-        insertPromptText(payload.paths.map(quotePathIfNeeded).join("\n"));
-      })
-      .then((u) => {
-        unlisten = u;
-      })
+	  useEffect(() => {
+	    let unlisten: null | (() => void) = null;
+	    void getCurrentWindow()
+	      .onDragDropEvent((event) => {
+	        const payload: DragDropEvent = event.payload;
+	        if (payload.type !== "drop") return;
+	        if (!payload.paths?.length) return;
+	        const rawPaths = payload.paths.slice();
+	        const sid = activeSessionIdRef.current || null;
+	        setErrorBanner(null);
+	        void (async () => {
+	          try {
+	            const imported = await invoke<string[]>("import_dropped_files", {
+	              sessionId: sid,
+	              paths: rawPaths,
+	            });
+	            const next = imported.length > 0 ? imported : rawPaths;
+	            insertPromptText(next.map(quotePathIfNeeded).join("\n"));
+	          } catch (err) {
+	            setErrorBanner(String(err));
+	            insertPromptText(rawPaths.map(quotePathIfNeeded).join("\n"));
+	          }
+	        })();
+	      })
+	      .then((u) => {
+	        unlisten = u;
+	      })
       .catch(() => {});
     return () => {
       if (unlisten) unlisten();
