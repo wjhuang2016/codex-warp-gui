@@ -856,6 +856,48 @@ summary.detailsSummary::after {
   text-decoration: line-through;
 }
 
+.usageList {
+  margin: 0;
+  padding-left: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.usageItem {
+  padding: 10px 10px;
+  border: 1px solid var(--border-weak);
+  background: var(--panel);
+  border-radius: 12px;
+}
+
+.usageItem.today {
+  border-color: var(--accent);
+  background: var(--selection);
+}
+
+.usageItemHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.usageDay {
+  font-weight: 700;
+}
+
+.usageTokens {
+  font-weight: 900;
+}
+
+.usageBreakdown {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .preview {
   margin: 0;
   padding: 12px;

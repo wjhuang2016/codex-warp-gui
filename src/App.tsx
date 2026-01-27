@@ -54,6 +54,18 @@ type ContextMetrics = {
   context_window: number;
 };
 
+type UsageRecord = {
+  ts_ms: number;
+  session_id: string;
+  thread_id?: string | null;
+  total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  cached_input_tokens: number;
+  context_window: number;
+};
+
 type RunFinished = {
   session_id: string;
   ts_ms: number;
@@ -97,6 +109,14 @@ function mimeToExt(mime: string): string {
   if (m.includes("webp")) return "webp";
   if (m.includes("gif")) return "gif";
   return "png";
+}
+
+function dayKeyLocal(tsMs: number): string {
+  const d = new Date(tsMs);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 type TimelineProps = {
@@ -791,11 +811,13 @@ function App() {
   const [blocksBySession, setBlocksBySession] = useState<Record<string, Block[]>>({});
   const [conclusionBySession, setConclusionBySession] = useState<Record<string, string>>({});
   const [metricsBySession, setMetricsBySession] = useState<Record<string, ContextMetrics>>({});
+  const [usageRecords, setUsageRecords] = useState<UsageRecord[]>([]);
+  const [usageLoading, setUsageLoading] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [cwd, setCwd] = useState("");
   const [blockQuery, setBlockQuery] = useState("");
   const [blockKindFilter, setBlockKindFilter] = useState<BlockKind | "all">("all");
-  const [rightTab, setRightTab] = useState<"todo" | "preview">("todo");
+  const [rightTab, setRightTab] = useState<"todo" | "preview" | "usage">("todo");
   const [showRename, setShowRename] = useState(false);
   const [renameDraft, setRenameDraft] = useState("");
   const [renameSaving, setRenameSaving] = useState(false);
@@ -1001,6 +1023,47 @@ function App() {
     () => conclusionBySession[activeSessionId] ?? "",
     [activeSessionId, conclusionBySession],
   );
+
+  const dailyUsage = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        dayKey: string;
+        total: number;
+        input: number;
+        output: number;
+        reasoning: number;
+        cached: number;
+        runs: number;
+      }
+    >();
+
+    for (const r of usageRecords) {
+      const key = dayKeyLocal(r.ts_ms);
+      const cur =
+        map.get(key) ??
+        {
+          dayKey: key,
+          total: 0,
+          input: 0,
+          output: 0,
+          reasoning: 0,
+          cached: 0,
+          runs: 0,
+        };
+      map.set(key, {
+        dayKey: key,
+        total: cur.total + (r.total_tokens || 0),
+        input: cur.input + (r.input_tokens || 0),
+        output: cur.output + (r.output_tokens || 0),
+        reasoning: cur.reasoning + (r.reasoning_output_tokens || 0),
+        cached: cur.cached + (r.cached_input_tokens || 0),
+        runs: cur.runs + 1,
+      });
+    }
+
+    return [...map.values()].sort((a, b) => b.dayKey.localeCompare(a.dayKey));
+  }, [usageRecords]);
 
   const runElapsedSec = useMemo(() => {
     if (!activeSessionId) return null;
@@ -1240,6 +1303,18 @@ function App() {
     }
   }
 
+  const refreshUsageRecords = useCallback(async () => {
+    setUsageLoading(true);
+    try {
+      const loaded = await invoke<UsageRecord[]>("list_usage_records", { maxRecords: 5000 });
+      setUsageRecords(loaded);
+    } catch {
+      // ignore
+    } finally {
+      setUsageLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     let unlistenEvent: (() => void) | null = null;
@@ -1309,6 +1384,8 @@ function App() {
           })),
         )
         .catch(() => {});
+
+      void refreshUsageRecords();
     })
       .then((unlisten) => {
         if (disposed) unlisten();
@@ -1322,7 +1399,7 @@ function App() {
       unlistenFinished?.();
       unlistenMetrics?.();
     };
-  }, []);
+  }, [refreshUsageRecords]);
 
   useEffect(() => {
     void invoke<SessionMeta[]>("list_sessions")
@@ -1337,6 +1414,10 @@ function App() {
       .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    void refreshUsageRecords();
+  }, [refreshUsageRecords]);
 
   useEffect(() => {
     void invoke<Settings>("get_settings")
@@ -1817,54 +1898,90 @@ function App() {
       </main>
 
       <aside className="right">
-        <div className="rightTabs">
-          <button
-            type="button"
-            className={`tab ${rightTab === "todo" ? "active" : ""}`}
-            onClick={() => setRightTab("todo")}
-          >
-            TODO
-          </button>
-          <button
-            type="button"
-            className={`tab ${rightTab === "preview" ? "active" : ""}`}
-            onClick={() => setRightTab("preview")}
-          >
-            Preview
-          </button>
-        </div>
-
-        {rightTab === "todo" ? (
-          <div className="panel">
-            <div className="panelTitle">
-              TODO{" "}
-              <span className="muted">
-                {todos.filter((t) => t.done).length}/{todos.length}
-              </span>
-            </div>
-            {todos.length > 0 ? (
-              <ul className="todoList">
-                {todos.map((t) => (
-                  <li key={`${t.done ? "1" : "0"}:${t.text}`} className={`todoItem ${t.done ? "done" : ""}`}>
-                    <span className={`todoBox ${t.done ? "done" : ""}`} aria-hidden />
-                    <span className="todoLabel">{t.text}</span>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <div className="muted">No TODOs parsed yet.</div>
-            )}
-          </div>
-        ) : (
-          <div className="panel">
-            <div className="panelTitle">Conclusion.md</div>
-            <div className="markdown">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                {conclusion.trim() ? conclusion : "_No conclusion yet._"}
-              </ReactMarkdown>
-            </div>
-          </div>
-        )}
+	        <div className="rightTabs">
+	          <button
+	            type="button"
+	            className={`tab ${rightTab === "todo" ? "active" : ""}`}
+	            onClick={() => setRightTab("todo")}
+	          >
+	            TODO
+	          </button>
+	          <button
+	            type="button"
+	            className={`tab ${rightTab === "usage" ? "active" : ""}`}
+	            onClick={() => setRightTab("usage")}
+	          >
+	            Usage
+	          </button>
+	          <button
+	            type="button"
+	            className={`tab ${rightTab === "preview" ? "active" : ""}`}
+	            onClick={() => setRightTab("preview")}
+	          >
+	            Preview
+	          </button>
+	        </div>
+	
+	        {rightTab === "todo" ? (
+	          <div className="panel">
+	            <div className="panelTitle">
+	              TODO{" "}
+	              <span className="muted">
+	                {todos.filter((t) => t.done).length}/{todos.length}
+	              </span>
+	            </div>
+	            {todos.length > 0 ? (
+	              <ul className="todoList">
+	                {todos.map((t) => (
+	                  <li key={`${t.done ? "1" : "0"}:${t.text}`} className={`todoItem ${t.done ? "done" : ""}`}>
+	                    <span className={`todoBox ${t.done ? "done" : ""}`} aria-hidden />
+	                    <span className="todoLabel">{t.text}</span>
+	                  </li>
+	                ))}
+	              </ul>
+	            ) : (
+	              <div className="muted">No TODOs parsed yet.</div>
+	            )}
+	          </div>
+	        ) : rightTab === "usage" ? (
+	          <div className="panel">
+	            <div className="panelTitle">
+	              Usage{" "}
+	              {usageLoading ? <span className="muted">Loading…</span> : null}
+	            </div>
+	            {dailyUsage.length > 0 ? (
+	              <ul className="usageList">
+	                {dailyUsage.slice(0, 14).map((d) => (
+	                  <li
+	                    key={d.dayKey}
+	                    className={`usageItem ${d.dayKey === dayKeyLocal(Date.now()) ? "today" : ""}`}
+	                  >
+	                    <div className="usageItemHeader">
+	                      <span className="usageDay mono">{d.dayKey}</span>
+	                      <span className="usageTokens mono">{d.total.toLocaleString()} tok</span>
+	                    </div>
+	                    <div className="usageBreakdown muted mono">
+	                      in {d.input.toLocaleString()} • out {d.output.toLocaleString()} • rsn{" "}
+	                      {d.reasoning.toLocaleString()} • cache {d.cached.toLocaleString()} •{" "}
+	                      {d.runs} runs
+	                    </div>
+	                  </li>
+	                ))}
+	              </ul>
+	            ) : (
+	              <div className="muted">No usage records yet.</div>
+	            )}
+	          </div>
+	        ) : (
+	          <div className="panel">
+	            <div className="panelTitle">Conclusion.md</div>
+	            <div className="markdown">
+	              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+	                {conclusion.trim() ? conclusion : "_No conclusion yet._"}
+	              </ReactMarkdown>
+	            </div>
+	          </div>
+	        )}
       </aside>
 
       {showSettings ? (

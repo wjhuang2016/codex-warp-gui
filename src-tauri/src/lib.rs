@@ -36,6 +36,19 @@ struct RunFinished {
     success: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct UsageRecord {
+    ts_ms: u64,
+    session_id: String,
+    thread_id: Option<String>,
+    total_tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    cached_input_tokens: u64,
+    context_window: u64,
+}
+
 #[derive(Clone, Serialize)]
 struct ShellOutput {
     data: String,
@@ -118,6 +131,11 @@ fn now_ms() -> u64 {
 fn sessions_root(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
     Ok(base.join("sessions"))
+}
+
+fn usage_log_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(base.join("usage.jsonl"))
 }
 
 fn session_dir(app: &AppHandle, session_id: &str) -> Result<PathBuf, String> {
@@ -738,7 +756,11 @@ fn capture_agent_message_text(
 #[derive(Clone, Copy)]
 struct TokenUsageSnapshot {
     window: u64,
-    used: u64,
+    total_tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    cached_input_tokens: u64,
     pct_left: u8,
 }
 
@@ -767,37 +789,41 @@ fn extract_token_usage_snapshot(msg: &serde_json::Value) -> Option<TokenUsageSna
 
     // For context-remaining, we want the token usage of the *current request* (prompt+generated),
     // not the cumulative, lifetime usage of the thread.
-    let used = usage
-        .get("last")
-        .and_then(|t| t.get("totalTokens"))
+    let last = usage.get("last").or_else(|| usage.get("total"))?;
+    let input_tokens = last.get("inputTokens").and_then(json_u64).unwrap_or(0);
+    let cached_input_tokens = last
+        .get("cachedInputTokens")
+        .and_then(json_u64)
+        .unwrap_or(0);
+    let output_tokens = last.get("outputTokens").and_then(json_u64).unwrap_or(0);
+    let reasoning_output_tokens = last
+        .get("reasoningOutputTokens")
+        .and_then(json_u64)
+        .unwrap_or(0);
+    let total_tokens = last
+        .get("totalTokens")
         .and_then(json_u64)
         .or_else(|| {
-            usage
-                .get("total")
-                .and_then(|t| t.get("totalTokens"))
-                .and_then(json_u64)
-        })
-        .or_else(|| {
-            usage
-                .get("last")
-                .and_then(|t| t.get("inputTokens"))
-                .and_then(json_u64)
-        })
-        .or_else(|| {
-            usage
-                .get("total")
-                .and_then(|t| t.get("inputTokens"))
-                .and_then(json_u64)
+            let sum = input_tokens + output_tokens + reasoning_output_tokens;
+            if sum == 0 {
+                None
+            } else {
+                Some(sum)
+            }
         })
         .unwrap_or(0);
 
-    let remaining = window.saturating_sub(used);
+    let remaining = window.saturating_sub(total_tokens);
     // Round to nearest integer to avoid jitter.
     let pct_left = ((remaining.saturating_mul(100) + (window / 2)) / window).min(100) as u8;
 
     Some(TokenUsageSnapshot {
         window,
-        used,
+        total_tokens,
+        input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        cached_input_tokens,
         pct_left,
     })
 }
@@ -807,7 +833,7 @@ async fn persist_context_metrics(meta_path: &Path, snapshot: TokenUsageSnapshot)
         return;
     };
     meta.context_window = Some(snapshot.window);
-    meta.context_used_tokens = Some(snapshot.used);
+    meta.context_used_tokens = Some(snapshot.total_tokens);
     meta.context_left_pct = Some(snapshot.pct_left);
     let _ = write_meta(meta_path, &meta).await;
 }
@@ -1352,7 +1378,7 @@ async fn run_turn_via_app_server(
     let mut exit_code: Option<i32> = Some(1);
     let mut last_metrics_emit_ms: u64 = 0;
     let mut last_metrics_emitted_pct: Option<u8> = None;
-    let mut pending_metrics: Option<TokenUsageSnapshot> = None;
+    let mut last_usage_snapshot: Option<TokenUsageSnapshot> = None;
 
     loop {
         let next = read_next_json_line(&mut lines, &mut cancel_rx).await;
@@ -1371,6 +1397,7 @@ async fn run_turn_via_app_server(
 
         if method == "thread/tokenUsage/updated" {
             if let Some(snapshot) = extract_token_usage_snapshot(&json) {
+                last_usage_snapshot = Some(snapshot);
                 if last_metrics_emitted_pct != Some(snapshot.pct_left) {
                     let now = now_ms();
                     if last_metrics_emit_ms == 0
@@ -1384,15 +1411,12 @@ async fn run_turn_via_app_server(
                                 session_id: session_id.clone(),
                                 ts_ms: now,
                                 context_left_pct: snapshot.pct_left,
-                                context_used_tokens: snapshot.used,
+                                context_used_tokens: snapshot.total_tokens,
                                 context_window: snapshot.window,
                             },
                         );
                         last_metrics_emit_ms = now;
                         last_metrics_emitted_pct = Some(snapshot.pct_left);
-                        pending_metrics = None;
-                    } else {
-                        pending_metrics = Some(snapshot);
                     }
                 }
             }
@@ -1439,21 +1463,34 @@ async fn run_turn_via_app_server(
         success = false;
     }
 
-    if let Some(snapshot) = pending_metrics {
-        if last_metrics_emitted_pct != Some(snapshot.pct_left) {
-            let now = now_ms();
-            persist_context_metrics(&meta_path, snapshot).await;
-            let _ = app.emit(
-                "codex_metrics",
-                ContextMetrics {
-                    session_id: session_id.clone(),
-                    ts_ms: now,
-                    context_left_pct: snapshot.pct_left,
-                    context_used_tokens: snapshot.used,
-                    context_window: snapshot.window,
-                },
-            );
-        }
+    if let Some(snapshot) = last_usage_snapshot {
+        let now = now_ms();
+        persist_context_metrics(&meta_path, snapshot).await;
+        let _ = app.emit(
+            "codex_metrics",
+            ContextMetrics {
+                session_id: session_id.clone(),
+                ts_ms: now,
+                context_left_pct: snapshot.pct_left,
+                context_used_tokens: snapshot.total_tokens,
+                context_window: snapshot.window,
+            },
+        );
+        let _ = append_usage_record(
+            &app,
+            &UsageRecord {
+                ts_ms: now,
+                session_id: session_id.clone(),
+                thread_id: effective_thread_id.clone(),
+                total_tokens: snapshot.total_tokens,
+                input_tokens: snapshot.input_tokens,
+                output_tokens: snapshot.output_tokens,
+                reasoning_output_tokens: snapshot.reasoning_output_tokens,
+                cached_input_tokens: snapshot.cached_input_tokens,
+                context_window: snapshot.window,
+            },
+        )
+        .await;
     }
 
     let cleaned_agent_text = strip_tool_citations(&agent_text);
@@ -1958,6 +1995,54 @@ async fn read_conclusion(app: AppHandle, session_id: String) -> Result<String, S
         .map_err(|e| e.to_string())
 }
 
+async fn append_usage_record(app: &AppHandle, record: &UsageRecord) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+
+    let path = usage_log_path(app)?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let line = serde_json::to_string(record).map_err(|e| e.to_string())?;
+    file.write_all(line.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    file.write_all(b"\n").await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_usage_records(
+    app: AppHandle,
+    max_records: Option<usize>,
+) -> Result<Vec<UsageRecord>, String> {
+    use std::collections::VecDeque;
+
+    let path = usage_log_path(&app)?;
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut out: VecDeque<UsageRecord> = VecDeque::new();
+    let mut lines = BufReader::new(file).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let record = match serde_json::from_str::<UsageRecord>(&line) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if let Some(max) = max_records {
+            while out.len() >= max {
+                out.pop_front();
+            }
+        }
+        out.push_back(record);
+    }
+    Ok(out.into_iter().collect())
+}
+
 #[tauri::command]
 async fn rename_session(app: AppHandle, session_id: String, title: String) -> Result<(), String> {
     let dir = session_dir(&app, &session_id)?;
@@ -2315,6 +2400,7 @@ pub fn run() {
             read_session_events,
             read_session_stderr,
             read_conclusion,
+            list_usage_records,
             rename_session,
             touch_session,
             delete_session,
