@@ -9,6 +9,7 @@ type ShellOutput = { data: string };
 type ShellCwd = { cwd: string };
 
 type Props = {
+  className?: string;
   initialCwd: string;
   onCwd: (cwd: string) => void;
   onError: (message: string) => void;
@@ -28,7 +29,7 @@ function cssVar(name: string, fallback: string): string {
   return v || fallback;
 }
 
-export function CwdShell({ initialCwd, onCwd, onError }: Props) {
+export function CwdShell({ className, initialCwd, onCwd, onError }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -153,5 +154,5 @@ export function CwdShell({ initialCwd, onCwd, onError }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return <div className="cwdShell" ref={containerRef} />;
+  return <div className={`cwdShell${className ? ` ${className}` : ""}`} ref={containerRef} />;
 }

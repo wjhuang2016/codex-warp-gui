@@ -625,6 +625,8 @@ function extractTodos(blocks: Block[]): TodoItem[] {
 function App() {
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showSessionSettings, setShowSessionSettings] = useState(false);
+  const [showCwdShell, setShowCwdShell] = useState(false);
   const [settings, setSettings] = useState<Settings>({});
   const [codexPathDraft, setCodexPathDraft] = useState("");
   const [defaultCwdDraft, setDefaultCwdDraft] = useState("");
@@ -657,6 +659,7 @@ function App() {
   const activeSessionIdRef = useRef("");
   const activeSessionStatusRef = useRef<SessionStatus | null>(null);
   const showSettingsRef = useRef(false);
+  const showSessionSettingsRef = useRef(false);
   const showRenameRef = useRef(false);
 
   const blocks = useMemo(
@@ -700,8 +703,15 @@ function App() {
     activeSessionIdRef.current = activeSessionId;
     activeSessionStatusRef.current = activeSession?.status ?? null;
     showSettingsRef.current = showSettings;
+    showSessionSettingsRef.current = showSessionSettings;
     showRenameRef.current = showRename;
-  }, [activeSession?.status, activeSessionId, showRename, showSettings]);
+  }, [activeSession?.status, activeSessionId, showRename, showSettings, showSessionSettings]);
+
+  function closeSessionSettings() {
+    setShowSessionSettings(false);
+    setShowCwdShell(false);
+    void invoke("stop_shell").catch(() => {});
+  }
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -709,6 +719,11 @@ function App() {
       if (showSettingsRef.current) {
         e.preventDefault();
         setShowSettings(false);
+        return;
+      }
+      if (showSessionSettingsRef.current) {
+        e.preventDefault();
+        closeSessionSettings();
         return;
       }
       if (showRenameRef.current) {
@@ -1191,6 +1206,12 @@ function App() {
     }
   }
 
+  function openSessionSettings() {
+    if (startingSessionId != null) return;
+    setErrorBanner(null);
+    setShowSessionSettings(true);
+  }
+
   async function renameActive() {
     if (!activeSession) return;
     setRenameDraft(activeSession.title);
@@ -1490,14 +1511,18 @@ function App() {
               placeholder="Describe what you want Codex to do…"
             />
             <div className="cwdRow">
-              <CwdShell
-                initialCwd={cwd}
-                onCwd={(next) => {
-                  if (cwd === next) return;
-                  setCwd(next);
-                }}
-                onError={(msg) => setErrorBanner(msg)}
-              />
+              <button
+                className="cwdPill mono"
+                type="button"
+                onClick={openSessionSettings}
+                title={cwd.trim() ? cwd.trim() : settings.last_cwd ?? settings.default_cwd ?? ""}
+              >
+                {cwd.trim()
+                  ? cwd.trim()
+                  : settings.last_cwd ?? settings.default_cwd
+                    ? `(default) ${settings.last_cwd ?? settings.default_cwd}`
+                    : "Pick a working directory…"}
+              </button>
               <button className="btn" type="button" onClick={pickCwd}>
                 Pick…
               </button>
@@ -1620,6 +1645,73 @@ function App() {
                 placeholder='e.g. "/Users/you/projects"'
               />
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showSessionSettings ? (
+        <div className="modalBackdrop" onClick={closeSessionSettings}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modalHeader">
+              <div className="modalTitle">Session settings</div>
+              <button className="btn" type="button" onClick={closeSessionSettings}>
+                Close
+              </button>
+            </div>
+
+            <div className="field">
+              <label className="label">Working directory (next run)</label>
+              <input
+                className="input mono"
+                value={cwd}
+                onChange={(e) => setCwd(e.currentTarget.value)}
+                placeholder={
+                  settings.last_cwd ?? settings.default_cwd ?? 'e.g. "/Users/you/projects"'
+                }
+              />
+              <div className="row">
+                <button className="btn" type="button" onClick={pickCwd}>
+                  Pick…
+                </button>
+                {cwd.trim() ? (
+                  <button className="btn" type="button" onClick={() => setCwd("")}>
+                    Use default
+                  </button>
+                ) : null}
+              </div>
+              <div className="muted">
+                {activeSessionId
+                  ? "Used the next time you click Continue in this session."
+                  : "Used when you start a new session."}
+              </div>
+            </div>
+
+            <details
+              onToggle={(e) => {
+                const open = (e.currentTarget as HTMLDetailsElement).open;
+                setShowCwdShell(open);
+                if (!open) {
+                  void invoke("stop_shell").catch(() => {});
+                }
+              }}
+            >
+              <summary className="detailsSummary">Advanced: zsh (cd …)</summary>
+              <div className="muted" style={{ marginTop: 8, marginBottom: 10 }}>
+                Type <span className="mono">cd &lt;path&gt;</span> and press{" "}
+                <span className="mono">Enter</span> to update the working directory.
+              </div>
+              {showCwdShell ? (
+                <CwdShell
+                  className="large"
+                  initialCwd={cwd}
+                  onCwd={(next) => {
+                    if (cwd === next) return;
+                    setCwd(next);
+                  }}
+                  onError={(msg) => setErrorBanner(msg)}
+                />
+              ) : null}
+            </details>
           </div>
         </div>
       ) : null}
