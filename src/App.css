@@ -571,6 +571,79 @@ body {
   overflow: auto;
 }
 
+.codeFrame {
+  border-radius: 12px;
+  border: 1px solid var(--code-border);
+  background: var(--code-bg);
+  font-size: 12px;
+  line-height: 1.55;
+  min-width: max-content;
+}
+
+.codeLine {
+  display: flex;
+  align-items: stretch;
+}
+
+.codeLn {
+  width: 5.5ch;
+  text-align: right;
+  padding: 0 10px;
+  color: var(--placeholder);
+  user-select: none;
+  border-right: 1px solid var(--border-weak);
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.codeText {
+  flex: 1;
+  padding: 0 12px;
+  white-space: pre;
+}
+
+.codeFrame.diff .codeLine.diff-meta {
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.codeFrame.diff .codeLine.diff-hunk {
+  background: var(--selection);
+  color: var(--accent-hover);
+}
+
+.codeFrame.diff .codeLine.diff-add {
+  background: var(--success-bg);
+}
+
+.codeFrame.diff .codeLine.diff-add .codeText {
+  border-left: 3px solid var(--success);
+  padding-left: 9px;
+}
+
+.codeFrame.diff .codeLine.diff-del {
+  background: var(--danger-bg);
+}
+
+.codeFrame.diff .codeLine.diff-del .codeText {
+  border-left: 3px solid var(--danger);
+  padding-left: 9px;
+}
+
+.codeFrame.diff .codeLine.diff-ctx .codeText {
+  border-left: 3px solid transparent;
+  padding-left: 9px;
+}
+
+.codeFrame.diff .codeLine.diff-hunk .codeText {
+  border-left: 3px solid var(--accent);
+  padding-left: 9px;
+}
+
+.codeFrame.diff .codeLine.diff-meta .codeText {
+  border-left: 3px solid var(--border);
+  padding-left: 9px;
+}
+
 .blockPre {
   margin: 0;
   white-space: pre-wrap;

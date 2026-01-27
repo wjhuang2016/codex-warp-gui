@@ -8,6 +8,7 @@ import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import "./App.css";
 import { CwdShell } from "./CwdShell";
+import { CodeFrame } from "./CodeFrame";
 
 const EMPTY_BLOCKS: Block[] = [];
 
@@ -1483,7 +1484,7 @@ function App() {
                       ) : b.kind === "thought" ? (
                         <pre className="blockPre mono">{b.body}</pre>
                       ) : b.kind === "command" ? (
-                        <pre className="blockPre mono">{b.body || "(no output yet)"}</pre>
+                        <CodeFrame text={b.body || "(no output yet)"} />
                       ) : (
                           <pre className="blockPre mono">{b.body}</pre>
                         )}
