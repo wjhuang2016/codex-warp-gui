@@ -41,6 +41,12 @@ export function CwdShell({ initialCwd, onCwd, onError }: Props) {
     const el = containerRef.current;
     if (!el) return;
 
+    const themeBg = cssVar("--input-bg", "#f1ece5");
+    const themeFg = cssVar("--text", "#1f2328");
+    const themeAccent = cssVar("--accent", "#0f766e");
+    const themeAccentHover = cssVar("--accent-hover", "#115e59");
+    const themeSelection = cssVar("--focus-ring", "rgba(15, 118, 110, 0.26)");
+
     const term = new Terminal({
       fontFamily:
         "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
@@ -50,11 +56,12 @@ export function CwdShell({ initialCwd, onCwd, onError }: Props) {
       scrollback: 2000,
       allowTransparency: true,
       theme: {
-        background: "transparent",
-        foreground: cssVar("--text", "#1f2328"),
-        cursor: cssVar("--accent", "#0f766e"),
-        selectionBackground: cssVar("--selection", "#d9f3ee"),
-        black: cssVar("--text", "#1f2328"),
+        background: themeBg,
+        foreground: themeFg,
+        cursor: themeAccent,
+        cursorAccent: themeBg,
+        selectionBackground: themeSelection,
+        black: themeFg,
         brightBlack: cssVar("--muted", "#6b7078"),
         red: cssVar("--danger", "#b42318"),
         brightRed: cssVar("--danger", "#b42318"),
@@ -62,12 +69,12 @@ export function CwdShell({ initialCwd, onCwd, onError }: Props) {
         brightGreen: cssVar("--success", "#1b8a5a"),
         yellow: cssVar("--warning", "#b45309"),
         brightYellow: cssVar("--warning", "#b45309"),
-        blue: cssVar("--accent", "#0f766e"),
-        brightBlue: cssVar("--accent-hover", "#115e59"),
-        magenta: cssVar("--accent", "#0f766e"),
-        brightMagenta: cssVar("--accent-hover", "#115e59"),
-        cyan: cssVar("--accent", "#0f766e"),
-        brightCyan: cssVar("--accent-hover", "#115e59"),
+        blue: themeAccent,
+        brightBlue: themeAccentHover,
+        magenta: themeAccent,
+        brightMagenta: themeAccentHover,
+        cyan: themeAccent,
+        brightCyan: themeAccentHover,
         white: cssVar("--panel", "#fffcf8"),
         brightWhite: cssVar("--popup", "#fffdfb"),
       },
