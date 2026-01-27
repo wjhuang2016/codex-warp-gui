@@ -653,6 +653,7 @@ function App() {
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
+  const composingPromptRef = useRef(false);
   const scrollStateBySessionRef = useRef<
     Record<string, { scrollTop: number; stickToBottom: boolean }>
   >({});
@@ -1487,11 +1488,19 @@ function App() {
               className="prompt"
               value={prompt}
               onChange={(e) => setPrompt(e.currentTarget.value)}
+              onCompositionStart={() => {
+                composingPromptRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                composingPromptRef.current = false;
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   const native = e.nativeEvent as any;
+                  if (composingPromptRef.current) return;
                   const isComposing = Boolean(native && native.isComposing);
-                  if (isComposing) return;
+                  const composingKeyCode = native && (native.keyCode === 229 || native.which === 229);
+                  if (isComposing || composingKeyCode) return;
                   if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
                   e.preventDefault();
                   void runInActiveSession();
