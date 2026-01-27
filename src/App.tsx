@@ -1052,17 +1052,17 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function startNewRun() {
-    const promptText = prompt.trim();
-    if (!promptText) return;
-    if (startingSessionId) return;
+  async function startNewRun(promptText: string): Promise<boolean> {
+    const promptTextTrimmed = promptText.trim();
+    if (!promptTextTrimmed) return false;
+    if (startingSessionId) return false;
     const prevActiveSessionId = activeSessionId;
     const sessionId = newSessionId();
     const now = Date.now();
 
     stickToBottomRef.current = true;
     setRunStartedAtBySession((prev) => ({ ...prev, [sessionId]: now }));
-    setLastPromptBySession((prev) => ({ ...prev, [sessionId]: promptText }));
+    setLastPromptBySession((prev) => ({ ...prev, [sessionId]: promptTextTrimmed }));
     setStartingSessionId(sessionId);
     setActiveSessionId(sessionId);
     setErrorBanner(null);
@@ -1070,7 +1070,7 @@ function App() {
     const nextCwd = cwd.trim() ? cwd.trim() : null;
     const placeholder: SessionMeta = {
       id: sessionId,
-      title: safeSessionTitle(promptText),
+      title: safeSessionTitle(promptTextTrimmed),
       created_at_ms: now,
       last_used_at_ms: now,
       cwd: nextCwd,
@@ -1088,7 +1088,7 @@ function App() {
     try {
       const meta = await invoke<SessionMeta>("start_run", {
         sessionId,
-        prompt: promptText,
+        prompt: promptTextTrimmed,
         cwd: nextCwd,
       });
       setSessions((prev) => sortSessionsByRecency(prev.map((s) => (s.id === sessionId ? meta : s))));
@@ -1096,6 +1096,7 @@ function App() {
       if (meta.status !== "running") {
         void loadSession(meta);
       }
+      return true;
     } catch (e) {
       setRunStartedAtBySession((prev) => {
         if (!(sessionId in prev)) return prev;
@@ -1116,6 +1117,7 @@ function App() {
       });
       setActiveSessionId(prevActiveSessionId);
       setErrorBanner(String(e));
+      return false;
     } finally {
       setStartingSessionId((cur) => (cur === sessionId ? null : cur));
     }
@@ -1135,7 +1137,9 @@ function App() {
     setErrorBanner(null);
 
     if (!activeSessionId) {
-      await startNewRun();
+      setPrompt("");
+      const ok = await startNewRun(promptText);
+      if (!ok) setPrompt(promptText);
       return;
     }
     if (activeSession?.status === "running") {
@@ -1143,6 +1147,7 @@ function App() {
       return;
     }
 
+    setPrompt("");
     try {
       const now = Date.now();
       setRunStartedAtBySession((prev) => ({ ...prev, [activeSessionId]: now }));
@@ -1169,6 +1174,7 @@ function App() {
         return next;
       });
       setErrorBanner(String(e));
+      setPrompt(promptText);
     }
   }
 
