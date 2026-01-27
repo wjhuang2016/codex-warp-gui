@@ -23,6 +23,11 @@ function debounceMs<T extends (...args: any[]) => void>(fn: T, delayMs: number):
   return wrapped;
 }
 
+function cssVar(name: string, fallback: string): string {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
 export function CwdShell({ initialCwd, onCwd, onError }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -46,15 +51,25 @@ export function CwdShell({ initialCwd, onCwd, onError }: Props) {
       allowTransparency: true,
       theme: {
         background: "transparent",
-        foreground: "#e8ecf3",
-        cursor: "#00d4ff",
-        selectionBackground: "rgba(0, 212, 255, 0.22)",
-        black: "#0b0d12",
-        brightBlack: "#263047",
-        cyan: "#00d4ff",
-        brightCyan: "#00d4ff",
-        magenta: "#7c5cff",
-        brightMagenta: "#7c5cff",
+        foreground: cssVar("--text", "#1f2328"),
+        cursor: cssVar("--accent", "#0f766e"),
+        selectionBackground: cssVar("--selection", "#d9f3ee"),
+        black: cssVar("--text", "#1f2328"),
+        brightBlack: cssVar("--muted", "#6b7078"),
+        red: cssVar("--danger", "#b42318"),
+        brightRed: cssVar("--danger", "#b42318"),
+        green: cssVar("--success", "#1b8a5a"),
+        brightGreen: cssVar("--success", "#1b8a5a"),
+        yellow: cssVar("--warning", "#b45309"),
+        brightYellow: cssVar("--warning", "#b45309"),
+        blue: cssVar("--accent", "#0f766e"),
+        brightBlue: cssVar("--accent-hover", "#115e59"),
+        magenta: cssVar("--accent", "#0f766e"),
+        brightMagenta: cssVar("--accent-hover", "#115e59"),
+        cyan: cssVar("--accent", "#0f766e"),
+        brightCyan: cssVar("--accent-hover", "#115e59"),
+        white: cssVar("--panel", "#fffcf8"),
+        brightWhite: cssVar("--popup", "#fffdfb"),
       },
     });
     const fit = new FitAddon();
@@ -133,4 +148,3 @@ export function CwdShell({ initialCwd, onCwd, onError }: Props) {
 
   return <div className="cwdShell" ref={containerRef} />;
 }
-

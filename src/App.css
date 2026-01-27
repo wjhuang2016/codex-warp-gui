@@ -1,15 +1,30 @@
 :root {
-  --bg: #0b0d12;
-  --panel: #0f1320;
-  --panel-2: #11172a;
-  --text: #e8ecf3;
-  --muted: #9aa4b2;
-  --border: rgba(255, 255, 255, 0.08);
-  --accent: #7c5cff;
-  --accent-2: #00d4ff;
-  --success: #32d583;
-  --danger: #ff4d6d;
-  --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  /* Paper + Teal (warm paper workbench) */
+  --bg: #f6f2ec;
+  --panel: #fffcf8;
+  --panel-2: #f1ece5;
+  --popup: #fffdfb;
+  --text: #1f2328;
+  --muted: #6b7078;
+  --placeholder: #9aa1aa;
+  --border: #e3dbd0;
+  --border-weak: #efe8df;
+  --input-bg: #f1ece5;
+  --input-border: #d8cfc4;
+  --accent: #0f766e;
+  --accent-hover: #115e59;
+  --selection: #d9f3ee;
+  --focus-ring: #0f766e4d;
+  --code-bg: #ece7e0;
+  --code-border: #ddd4c7;
+  --quote-bg: #0f766e1a;
+  --success: #1b8a5a;
+  --success-bg: #1b8a5a1a;
+  --warning: #b45309;
+  --warning-bg: #b453091a;
+  --danger: #b42318;
+  --danger-bg: #b423181a;
+  --shadow: 0 10px 30px rgba(31, 35, 40, 0.12);
 
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
     "Segoe UI", Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
@@ -43,7 +58,7 @@ body {
 }
 
 .sidebar {
-  background: linear-gradient(180deg, var(--panel), #0c0f19);
+  background: linear-gradient(180deg, var(--panel), var(--bg));
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -91,7 +106,7 @@ body {
 
 .sessionRow {
   text-align: left;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 10px 10px;
@@ -100,12 +115,14 @@ body {
 }
 
 .sessionRow:hover {
-  border-color: rgba(255, 255, 255, 0.16);
+  border-color: var(--input-border);
+  background: var(--panel-2);
 }
 
 .sessionRow.active {
-  border-color: rgba(124, 92, 255, 0.7);
-  box-shadow: 0 0 0 1px rgba(124, 92, 255, 0.25);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--focus-ring);
+  background: var(--selection);
 }
 
 .sessionTitle {
@@ -129,20 +146,24 @@ body {
   border-radius: 999px;
   font-size: 11px;
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--panel-2);
+  color: var(--muted);
 }
 
 .pill.running {
-  border-color: rgba(0, 212, 255, 0.35);
-  color: rgba(0, 212, 255, 0.95);
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--selection);
 }
 .pill.done {
-  border-color: rgba(124, 92, 255, 0.35);
-  color: rgba(124, 92, 255, 0.95);
+  border-color: var(--success);
+  color: var(--success);
+  background: var(--success-bg);
 }
 .pill.error {
-  border-color: rgba(255, 77, 109, 0.4);
-  color: rgba(255, 77, 109, 0.95);
+  border-color: var(--danger);
+  color: var(--danger);
+  background: var(--danger-bg);
 }
 
 .main {
@@ -158,8 +179,7 @@ body {
   gap: 12px;
   padding: 14px;
   border-top: 1px solid var(--border);
-  background: rgba(17, 23, 42, 0.45);
-  backdrop-filter: blur(8px);
+  background: var(--panel-2);
 }
 
 .filterBar {
@@ -168,14 +188,14 @@ body {
   align-items: center;
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
-  background: rgba(17, 23, 42, 0.25);
+  background: var(--panel);
   min-width: 0;
 }
 
 .runBanner {
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
-  background: rgba(17, 23, 42, 0.18);
+  background: var(--selection);
 }
 
 .runBannerLine {
@@ -186,7 +206,7 @@ body {
 }
 
 .runBullet {
-  color: rgba(0, 212, 255, 0.9);
+  color: var(--accent);
   font-size: 18px;
   line-height: 1;
 }
@@ -207,17 +227,21 @@ body {
 .search {
   flex: 1;
   min-width: 0;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--border);
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
   border-radius: 999px;
   padding: 9px 12px;
   color: var(--text);
   outline: none;
 }
 
+.search::placeholder {
+  color: var(--placeholder);
+}
+
 .search:focus {
-  border-color: rgba(0, 212, 255, 0.45);
-  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.12);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--focus-ring);
 }
 
 .chips {
@@ -231,15 +255,15 @@ body {
   border-radius: 999px;
   padding: 7px 10px;
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--panel);
   color: var(--text);
   cursor: pointer;
   font-size: 12px;
 }
 
 .chip.active {
-  border-color: rgba(0, 212, 255, 0.35);
-  background: rgba(0, 212, 255, 0.08);
+  border-color: var(--accent);
+  background: var(--selection);
 }
 
 .results {
@@ -258,27 +282,35 @@ body {
   resize: vertical;
   min-height: 44px;
   max-height: 160px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--border);
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
   border-radius: 12px;
   padding: 10px 12px;
   color: var(--text);
   outline: none;
 }
 
+.prompt::placeholder {
+  color: var(--placeholder);
+}
+
 .prompt:focus {
-  border-color: rgba(0, 212, 255, 0.45);
-  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.12);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--focus-ring);
 }
 
 .cwd {
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--border);
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
   border-radius: 12px;
   padding: 10px 12px;
   color: var(--text);
   outline: none;
   min-width: 0;
+}
+
+.cwd::placeholder {
+  color: var(--placeholder);
 }
 
 .cwdRow {
@@ -297,16 +329,16 @@ body {
   height: 44px;
   max-height: 44px;
   overflow: hidden;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--border);
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
   border-radius: 12px;
   padding: 6px 8px;
   min-width: 0;
 }
 
 .cwdShell:focus-within {
-  border-color: rgba(0, 212, 255, 0.45);
-  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.12);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--focus-ring);
 }
 
 .cwdShell .xterm,
@@ -320,13 +352,13 @@ body {
 }
 
 .cwd:focus {
-  border-color: rgba(0, 212, 255, 0.45);
-  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.12);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--focus-ring);
 }
 
 .btn {
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--panel);
   color: var(--text);
   border-radius: 12px;
   padding: 10px 12px;
@@ -334,7 +366,8 @@ body {
 }
 
 .btn:hover:enabled {
-  border-color: rgba(255, 255, 255, 0.18);
+  border-color: var(--input-border);
+  background: var(--panel-2);
 }
 
 .btn:disabled {
@@ -343,13 +376,15 @@ body {
 }
 
 .btn.primary {
-  background: linear-gradient(
-    135deg,
-    rgba(124, 92, 255, 0.9),
-    rgba(0, 212, 255, 0.55)
-  );
-  border-color: rgba(124, 92, 255, 0.55);
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--panel);
   box-shadow: var(--shadow);
+}
+
+.btn.primary:hover:enabled {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 
 .iconBtn {
@@ -360,14 +395,14 @@ body {
   justify-content: center;
   border-radius: 10px;
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--panel);
   color: var(--muted);
   cursor: pointer;
   flex-shrink: 0;
 }
 
 .iconBtn:hover {
-  border-color: rgba(255, 255, 255, 0.16);
+  border-color: var(--input-border);
   color: var(--text);
 }
 
@@ -392,8 +427,8 @@ body {
 }
 
 .emptyState {
-  border: 1px dashed rgba(255, 255, 255, 0.14);
-  background: rgba(0, 0, 0, 0.14);
+  border: 1px dashed var(--border-weak);
+  background: var(--panel-2);
   border-radius: 16px;
   padding: 18px;
   max-width: 80ch;
@@ -405,12 +440,12 @@ body {
 }
 
 .block {
-  --block-accent: rgba(255, 255, 255, 0.14);
+  --block-accent: var(--border);
   position: relative;
-  background: rgba(255, 255, 255, 0.035);
+  background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 14px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 8px 24px rgba(31, 35, 40, 0.10);
   overflow: hidden;
 }
 
@@ -428,20 +463,20 @@ body {
 }
 
 .block.assistant {
-  --block-accent: rgba(124, 92, 255, 0.9);
+  --block-accent: var(--accent);
 }
 .block.thought {
-  --block-accent: rgba(0, 212, 255, 0.9);
+  --block-accent: var(--muted);
 }
 .block.command {
-  --block-accent: rgba(50, 213, 131, 0.9);
+  --block-accent: var(--warning);
 }
 .block.error {
-  --block-accent: rgba(255, 77, 109, 0.95);
+  --block-accent: var(--danger);
 }
 .block.status,
 .block.event {
-  --block-accent: rgba(154, 164, 178, 0.75);
+  --block-accent: var(--border);
 }
 
 .blockHeader {
@@ -450,8 +485,8 @@ body {
   justify-content: space-between;
   gap: 12px;
   padding: 9px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-  background: rgba(17, 23, 42, 0.26);
+  border-bottom: 1px solid var(--border-weak);
+  background: var(--panel-2);
 }
 
 .blockHeaderLeft {
@@ -517,8 +552,8 @@ body {
 .block.event .blockPre {
   padding: 10px;
   border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  background: rgba(0, 0, 0, 0.16);
+  border: 1px solid var(--code-border);
+  background: var(--code-bg);
 }
 
 .block.assistant .blockBody .markdown {
@@ -533,22 +568,25 @@ body {
 }
 
 .pill.in_progress {
-  border-color: rgba(0, 212, 255, 0.35);
-  color: rgba(0, 212, 255, 0.95);
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--selection);
 }
 
 .pill.completed {
-  border-color: rgba(124, 92, 255, 0.35);
-  color: rgba(124, 92, 255, 0.95);
+  border-color: var(--success);
+  color: var(--success);
+  background: var(--success-bg);
 }
 
 .pill.failed {
-  border-color: rgba(255, 77, 109, 0.4);
-  color: rgba(255, 77, 109, 0.95);
+  border-color: var(--danger);
+  color: var(--danger);
+  background: var(--danger-bg);
 }
 
 .right {
-  background: linear-gradient(180deg, var(--panel), #0c0f19);
+  background: linear-gradient(180deg, var(--panel), var(--bg));
   border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -567,14 +605,14 @@ body {
   border-radius: 999px;
   padding: 7px 12px;
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--panel);
   color: var(--text);
   cursor: pointer;
 }
 
 .tab.active {
-  border-color: rgba(0, 212, 255, 0.35);
-  background: rgba(0, 212, 255, 0.08);
+  border-color: var(--accent);
+  background: var(--selection);
 }
 
 .panel {
@@ -607,8 +645,8 @@ body {
   gap: 10px;
   align-items: flex-start;
   padding: 8px 8px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border-weak);
+  background: var(--panel);
   border-radius: 12px;
 }
 
@@ -616,16 +654,16 @@ body {
   width: 14px;
   height: 14px;
   border-radius: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(0, 0, 0, 0.12);
+  border: 1px solid var(--input-border);
+  background: var(--panel-2);
   margin-top: 2px;
   flex-shrink: 0;
   position: relative;
 }
 
 .todoBox.done {
-  border-color: rgba(124, 92, 255, 0.55);
-  background: rgba(124, 92, 255, 0.28);
+  border-color: var(--accent);
+  background: var(--accent);
 }
 
 .todoBox.done::after {
@@ -635,7 +673,7 @@ body {
   top: 1px;
   width: 4px;
   height: 8px;
-  border: solid rgba(255, 255, 255, 0.92);
+  border: solid var(--panel);
   border-width: 0 2px 2px 0;
   transform: rotate(45deg);
 }
@@ -656,7 +694,7 @@ body {
   padding: 12px;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--panel);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -665,7 +703,7 @@ body {
   padding: 12px;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--panel);
   font-size: 13px;
   line-height: 1.55;
 }
@@ -711,7 +749,7 @@ body {
 }
 
 .markdown :is(li)::marker {
-  color: rgba(0, 212, 255, 0.78);
+  color: var(--accent);
 }
 
 .markdown :is(li > p) {
@@ -737,11 +775,11 @@ body {
 
 .markdown strong {
   font-weight: 800;
-  color: rgba(232, 236, 243, 0.98);
+  color: var(--text);
 }
 
 .markdown em {
-  color: rgba(0, 212, 255, 0.92);
+  color: var(--accent);
 }
 
 .markdown :is(code) {
@@ -753,26 +791,25 @@ body {
 .markdown :not(pre) > code {
   padding: 2px 7px;
   border-radius: 9px;
-  border: 1px solid rgba(0, 212, 255, 0.22);
-  background: rgba(0, 0, 0, 0.18);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
-  color: rgba(0, 212, 255, 0.92);
+  border: 1px solid var(--code-border);
+  background: var(--code-bg);
+  color: var(--accent);
 }
 
 .markdown blockquote {
   margin: 10px 0;
   padding: 8px 12px;
-  border-left: 3px solid rgba(0, 212, 255, 0.6);
-  background: rgba(0, 0, 0, 0.14);
+  border-left: 3px solid var(--accent);
+  background: var(--quote-bg);
   border-radius: 10px;
 }
 
 .markdown :is(pre) {
   padding: 10px;
   border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--code-border);
   overflow: auto;
-  background: rgba(0, 0, 0, 0.2);
+  background: var(--code-bg);
 }
 
 .markdown table {
@@ -783,24 +820,28 @@ body {
 
 .markdown th,
 .markdown td {
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--code-border);
   padding: 8px 10px;
   text-align: left;
 }
 
 .markdown th {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--panel-2);
 }
 
 .markdown hr {
   border: none;
-  border-top: 1px solid rgba(255, 255, 255, 0.10);
+  border-top: 1px solid var(--border-weak);
   margin: 12px 0;
 }
 
 .markdown a {
-  color: rgba(0, 212, 255, 0.95);
+  color: var(--accent);
   text-decoration: none;
+}
+
+.markdown a:hover {
+  color: var(--accent-hover);
 }
 
 .markdown a:hover {
@@ -809,16 +850,16 @@ body {
 
 .errorBanner {
   padding: 10px 14px;
-  border-bottom: 1px solid rgba(255, 77, 109, 0.35);
-  background: rgba(255, 77, 109, 0.08);
-  color: rgba(255, 180, 195, 0.95);
+  border-bottom: 1px solid var(--danger);
+  background: var(--danger-bg);
+  color: var(--danger);
   font-size: 13px;
 }
 
 .modalBackdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: rgba(31, 35, 40, 0.18);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -829,7 +870,7 @@ body {
   width: min(760px, 100%);
   max-height: min(80vh, 760px);
   overflow: auto;
-  background: var(--panel-2);
+  background: var(--popup);
   border: 1px solid var(--border);
   border-radius: 16px;
   box-shadow: var(--shadow);
@@ -866,8 +907,8 @@ body {
 }
 
 .input {
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--border);
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
   border-radius: 12px;
   padding: 10px 12px;
   color: var(--text);
@@ -875,9 +916,13 @@ body {
   min-width: 0;
 }
 
+.input::placeholder {
+  color: var(--placeholder);
+}
+
 .input:focus {
-  border-color: rgba(0, 212, 255, 0.45);
-  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.12);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--focus-ring);
 }
 
 .row {
@@ -889,10 +934,10 @@ body {
 
 .detected {
   margin-top: 8px;
-  border: 1px dashed rgba(255, 255, 255, 0.14);
+  border: 1px dashed var(--border-weak);
   border-radius: 12px;
   padding: 10px;
-  background: rgba(0, 0, 0, 0.12);
+  background: var(--panel-2);
 }
 
 .detected ul {
@@ -905,7 +950,7 @@ body {
   background: none;
   padding: 0;
   cursor: pointer;
-  color: rgba(0, 212, 255, 0.95);
+  color: var(--accent);
   text-align: left;
 }
 
