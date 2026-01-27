@@ -730,11 +730,15 @@ fn extract_token_usage_snapshot(msg: &serde_json::Value) -> Option<TokenUsageSna
         return None;
     }
     let params = msg.get("params")?;
-    let window = json_u64(params.get("modelContextWindow")?)?;
+    let usage = params.get("tokenUsage")?;
+    let window = params
+        .get("modelContextWindow")
+        .and_then(json_u64)
+        .or_else(|| usage.get("modelContextWindow").and_then(json_u64))
+        .unwrap_or(0);
     if window == 0 {
         return None;
     }
-    let usage = params.get("tokenUsage")?;
 
     let used = usage
         .get("total")

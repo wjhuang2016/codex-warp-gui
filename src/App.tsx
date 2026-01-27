@@ -904,6 +904,33 @@ function App() {
     return typeof persisted === "number" ? persisted : null;
   }, [activeSession?.context_left_pct, activeSessionId, metricsBySession]);
 
+  const contextUsage = useMemo(() => {
+    if (!activeSessionId) return null;
+    const live = metricsBySession[activeSessionId];
+    const pct = typeof live?.context_left_pct === "number" ? live.context_left_pct : null;
+    const used =
+      typeof live?.context_used_tokens === "number" ? live.context_used_tokens : null;
+    const window = typeof live?.context_window === "number" ? live.context_window : null;
+    if (pct != null) return { pct, used, window };
+
+    const persistedPct =
+      typeof activeSession?.context_left_pct === "number" ? activeSession.context_left_pct : null;
+    if (persistedPct == null) return null;
+    const persistedUsed =
+      typeof activeSession?.context_used_tokens === "number"
+        ? activeSession.context_used_tokens
+        : null;
+    const persistedWindow =
+      typeof activeSession?.context_window === "number" ? activeSession.context_window : null;
+    return { pct: persistedPct, used: persistedUsed, window: persistedWindow };
+  }, [
+    activeSession?.context_left_pct,
+    activeSession?.context_used_tokens,
+    activeSession?.context_window,
+    activeSessionId,
+    metricsBySession,
+  ]);
+
   const runHeadline = useMemo(() => {
     if (!activeSessionId) return "";
     const p = lastPromptBySession[activeSessionId];
@@ -1554,10 +1581,22 @@ function App() {
               </button>
             ) : null}
           </div>
-          <div className="muted mono results">
-            {filteredBlocks.length}/{blocks.length}
-          </div>
-	        </div>
+		          <div className="muted mono results">
+		            {filteredBlocks.length}/{blocks.length}
+		          </div>
+              {contextUsage ? (
+                <div
+                  className="pill ctx"
+                  title={
+                    contextUsage.used != null && contextUsage.window != null
+                      ? `${contextUsage.used.toLocaleString()} / ${contextUsage.window.toLocaleString()} tokens used`
+                      : "Context remaining"
+                  }
+                >
+                  {contextUsage.pct}% ctx left
+                </div>
+              ) : null}
+		        </div>
 	
 		        {activeSession?.status === "running" ? (
 		          <div className="runBanner">
