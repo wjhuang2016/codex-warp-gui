@@ -150,6 +150,20 @@ fn escape_single_quotes(s: &str) -> String {
     out
 }
 
+fn sanitize_file_ext(ext: &str) -> String {
+    let trimmed = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    let filtered: String = trimmed
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    if filtered.is_empty() {
+        "png".to_string()
+    } else {
+        filtered
+    }
+}
+
 fn choose_initial_cwd(settings: &Settings, requested: Option<String>) -> Option<String> {
     let mut cwd = requested.and_then(|s| {
         let t = s.trim().to_string();
@@ -2177,6 +2191,39 @@ async fn stop_shell(state: tauri::State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn save_pasted_image(
+    app: AppHandle,
+    session_id: Option<String>,
+    ext: Option<String>,
+    data_base64: String,
+) -> Result<String, String> {
+    use base64::Engine;
+
+    let ext = sanitize_file_ext(ext.as_deref().unwrap_or("png"));
+    let raw = data_base64.trim();
+    let b64 = raw.rsplit_once(',').map(|(_, tail)| tail).unwrap_or(raw);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| e.to_string())?;
+
+    let base = match session_id.as_deref() {
+        Some(sid) if !sid.trim().is_empty() => session_dir(&app, sid)?,
+        _ => app.path().app_data_dir().map_err(|e| e.to_string())?,
+    };
+    let dir = base.join("attachments");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let filename = format!("pasted-{}-{}.{}", now_ms(), Uuid::new_v4(), ext);
+    let path = dir.join(filename);
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2201,7 +2248,8 @@ pub fn run() {
             shell_write,
             shell_resize,
             shell_cd,
-            stop_shell
+            stop_shell,
+            save_pasted_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -2,7 +2,10 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { DragDropEvent } from "@tauri-apps/api/webview";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { ClipboardEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -70,6 +73,31 @@ type Block = {
   status?: string;
   collapsed?: boolean;
 };
+
+function quotePathIfNeeded(path: string): string {
+  if (!path) return path;
+  if (/[ \t]/.test(path)) return JSON.stringify(path);
+  return path;
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  const chunks: string[] = [];
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    chunks.push(String.fromCharCode(...bytes.subarray(i, i + chunkSize)));
+  }
+  return btoa(chunks.join(""));
+}
+
+function mimeToExt(mime: string): string {
+  const m = (mime || "").toLowerCase();
+  if (m.includes("png")) return "png";
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("webp")) return "webp";
+  if (m.includes("gif")) return "gif";
+  return "png";
+}
 
 type TimelineProps = {
   activeSessionId: string;
@@ -775,6 +803,7 @@ function App() {
   const [lastPromptBySession, setLastPromptBySession] = useState<Record<string, string>>({});
   const [tickerMs, setTickerMs] = useState(() => Date.now());
 
+  const promptRef = useRef<HTMLTextAreaElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
@@ -787,6 +816,28 @@ function App() {
   const showSettingsRef = useRef(false);
   const showSessionSettingsRef = useRef(false);
   const showRenameRef = useRef(false);
+
+  const insertPromptText = useCallback((text: string) => {
+    if (!text) return;
+    const el = promptRef.current;
+    if (!el) {
+      setPrompt((prev) => prev + text);
+      return;
+    }
+    const start = typeof el.selectionStart === "number" ? el.selectionStart : el.value.length;
+    const end = typeof el.selectionEnd === "number" ? el.selectionEnd : el.value.length;
+    const value = el.value;
+    const next = value.slice(0, start) + text + value.slice(end);
+    setPrompt(next);
+    const pos = start + text.length;
+    requestAnimationFrame(() => {
+      const el2 = promptRef.current;
+      if (!el2) return;
+      el2.focus();
+      el2.selectionStart = pos;
+      el2.selectionEnd = pos;
+    });
+  }, []);
 
   const blocks = useMemo(
     () => blocksBySession[activeSessionId] ?? EMPTY_BLOCKS,
@@ -833,11 +884,66 @@ function App() {
     showRenameRef.current = showRename;
   }, [activeSession?.status, activeSessionId, showRename, showSettings, showSessionSettings]);
 
+  useEffect(() => {
+    let unlisten: null | (() => void) = null;
+    void getCurrentWindow()
+      .onDragDropEvent((event) => {
+        const payload: DragDropEvent = event.payload;
+        if (payload.type !== "drop") return;
+        if (!payload.paths?.length) return;
+        insertPromptText(payload.paths.map(quotePathIfNeeded).join("\n"));
+      })
+      .then((u) => {
+        unlisten = u;
+      })
+      .catch(() => {});
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [insertPromptText]);
+
   function closeSessionSettings() {
     setShowSessionSettings(false);
     setShowCwdShell(false);
     void invoke("stop_shell").catch(() => {});
   }
+
+  const onPromptPaste = useCallback(
+    async (e: ClipboardEvent<HTMLTextAreaElement>) => {
+      const items = e.clipboardData?.items;
+      if (!items?.length) return;
+      const images: File[] = [];
+      for (const item of items) {
+        if (item.kind !== "file") continue;
+        const type = item.type || "";
+        if (!type.toLowerCase().startsWith("image/")) continue;
+        const file = item.getAsFile();
+        if (file) images.push(file);
+      }
+      if (images.length === 0) return;
+
+      e.preventDefault();
+      setErrorBanner(null);
+
+      try {
+        for (let i = 0; i < images.length; i++) {
+          const file = images[i];
+          const buffer = await file.arrayBuffer();
+          const dataBase64 = arrayBufferToBase64(buffer);
+          const ext = mimeToExt(file.type);
+          const path = await invoke<string>("save_pasted_image", {
+            sessionId: activeSessionId || null,
+            ext,
+            dataBase64,
+          });
+          insertPromptText(path + (i === images.length - 1 ? "" : "\n"));
+        }
+      } catch (err) {
+        setErrorBanner(String(err));
+      }
+    },
+    [activeSessionId, insertPromptText],
+  );
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -1629,15 +1735,17 @@ function App() {
 
 	        <div className="composer">
 	          <div className="composerLeft">
-            <textarea
-              className="prompt"
-              value={prompt}
-              onChange={(e) => setPrompt(e.currentTarget.value)}
-              onCompositionStart={() => {
-                composingPromptRef.current = true;
-              }}
-              onCompositionEnd={() => {
-                composingPromptRef.current = false;
+	            <textarea
+	              className="prompt"
+	              ref={promptRef}
+	              value={prompt}
+	              onChange={(e) => setPrompt(e.currentTarget.value)}
+	              onPaste={onPromptPaste}
+	              onCompositionStart={() => {
+	                composingPromptRef.current = true;
+	              }}
+	              onCompositionEnd={() => {
+	                composingPromptRef.current = false;
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
