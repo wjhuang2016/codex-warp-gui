@@ -464,6 +464,17 @@ async fn read_meta(path: &Path) -> Option<SessionMeta> {
     if meta.last_used_at_ms == 0 {
         meta.last_used_at_ms = meta.created_at_ms;
     }
+    if let (Some(window), Some(used)) = (meta.context_window, meta.context_used_tokens) {
+        if window == 0 || used > window {
+            meta.context_window = None;
+            meta.context_used_tokens = None;
+            meta.context_left_pct = None;
+        } else {
+            let remaining = window.saturating_sub(used);
+            let pct_left = ((remaining.saturating_mul(100) + (window / 2)) / window).min(100) as u8;
+            meta.context_left_pct = Some(pct_left);
+        }
+    }
     Some(meta)
 }
 
@@ -754,14 +765,22 @@ fn extract_token_usage_snapshot(msg: &serde_json::Value) -> Option<TokenUsageSna
         return None;
     }
 
+    // For context-remaining, we want the token usage of the *current request* (prompt+generated),
+    // not the cumulative, lifetime usage of the thread.
     let used = usage
-        .get("total")
+        .get("last")
         .and_then(|t| t.get("totalTokens"))
         .and_then(json_u64)
         .or_else(|| {
             usage
-                .get("last")
+                .get("total")
                 .and_then(|t| t.get("totalTokens"))
+                .and_then(json_u64)
+        })
+        .or_else(|| {
+            usage
+                .get("last")
+                .and_then(|t| t.get("inputTokens"))
                 .and_then(json_u64)
         })
         .or_else(|| {
