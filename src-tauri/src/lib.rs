@@ -1017,8 +1017,6 @@ async fn run_turn_via_app_server(
             "thread/resume",
             serde_json::json!({
                 "threadId": existing,
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access",
                 "cwd": cwd.clone(),
                 "config": { "skip_git_repo_check": true },
             }),
@@ -1076,8 +1074,6 @@ async fn run_turn_via_app_server(
             start_id,
             "thread/start",
             serde_json::json!({
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access",
                 "cwd": cwd.clone(),
                 "config": { "skip_git_repo_check": true },
             }),
@@ -1159,7 +1155,6 @@ async fn run_turn_via_app_server(
         "turn/start",
         serde_json::json!({
             "threadId": thread_id,
-            "approvalPolicy": "never",
             "input": [ { "type": "text", "text": prompt_text } ],
         }),
     )
