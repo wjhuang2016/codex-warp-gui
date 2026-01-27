@@ -1018,7 +1018,7 @@ async fn run_turn_via_app_server(
             serde_json::json!({
                 "threadId": existing,
                 "approvalPolicy": "never",
-                "sandbox": "workspace-write",
+                "sandbox": "danger-full-access",
                 "cwd": cwd.clone(),
                 "config": { "skip_git_repo_check": true },
             }),
@@ -1077,7 +1077,7 @@ async fn run_turn_via_app_server(
             "thread/start",
             serde_json::json!({
                 "approvalPolicy": "never",
-                "sandbox": "workspace-write",
+                "sandbox": "danger-full-access",
                 "cwd": cwd.clone(),
                 "config": { "skip_git_repo_check": true },
             }),
