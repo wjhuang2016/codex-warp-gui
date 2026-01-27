@@ -886,7 +886,7 @@ function App() {
     setErrorBanner(null);
     try {
       const [lines, stderrLines, conclusionText] = await Promise.all([
-        invoke<string[]>("read_session_events", { sessionId: session.id, maxLines: 2000 }),
+        invoke<string[]>("read_session_events", { sessionId: session.id }),
         invoke<string[]>("read_session_stderr", { sessionId: session.id, maxLines: 2000 }).catch(
           () => [],
         ),
