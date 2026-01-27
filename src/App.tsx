@@ -271,6 +271,15 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
 
   const method = typeof (e.json as any).method === "string" ? (e.json as any).method : undefined;
   if (method) {
+    if (
+      method === "thread/tokenUsage/updated" ||
+      method === "account/rateLimits/updated" ||
+      method === "item/reasoning/summaryPartAdded" ||
+      method.startsWith("codex/event/")
+    ) {
+      return blocks;
+    }
+
     const params = isObject((e.json as any).params) ? ((e.json as any).params as any) : {};
 
     if (method === "item/agentMessage/delta") {

@@ -581,6 +581,16 @@ async fn persist_and_emit_stdout(
 ) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
+    if let Some(method) = json.get("method").and_then(|v| v.as_str()) {
+        if method == "thread/tokenUsage/updated"
+            || method == "account/rateLimits/updated"
+            || method == "item/reasoning/summaryPartAdded"
+            || method.starts_with("codex/event/")
+        {
+            return Ok(());
+        }
+    }
+
     events_file
         .write_all(raw.as_bytes())
         .await
