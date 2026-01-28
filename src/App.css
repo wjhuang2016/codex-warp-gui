@@ -279,6 +279,8 @@ body {
 }
 
 .prompt {
+  width: 100%;
+  box-sizing: border-box;
   resize: vertical;
   min-height: 44px;
   max-height: 160px;
