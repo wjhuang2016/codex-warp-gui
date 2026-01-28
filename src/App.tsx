@@ -5,7 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { DragDropEvent } from "@tauri-apps/api/webview";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ClipboardEvent } from "react";
+import type { ChangeEvent, ClipboardEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -71,6 +71,12 @@ type RunFinished = {
   ts_ms: number;
   exit_code: number | null;
   success: boolean;
+};
+
+type SkillSummary = {
+  name: string;
+  description: string;
+  path: string;
 };
 
 type BlockKind = "assistant" | "command" | "thought" | "status" | "error" | "event";
@@ -304,6 +310,13 @@ type TodoItem = {
   done: boolean;
 };
 
+type SkillPickerState = {
+  start: number;
+  end: number;
+  query: string;
+  selected: number;
+};
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -324,6 +337,17 @@ function previewText(text: string): string {
   const max = 140;
   if (first.length <= max) return first;
   return `${first.slice(0, max)}…`;
+}
+
+function computeSkillTrigger(text: string, cursor: number): Omit<SkillPickerState, "selected"> | null {
+  const pos = Math.max(0, Math.min(cursor, text.length));
+  const before = text.slice(0, pos);
+  const idx = before.lastIndexOf("$");
+  if (idx === -1) return null;
+  if (idx > 0 && !/\s/.test(before[idx - 1])) return null;
+  const query = before.slice(idx + 1);
+  if (!/^[a-zA-Z0-9_-]*$/.test(query)) return null;
+  return { start: idx, end: pos, query };
 }
 
 function upsertBlock(blocks: Block[], next: Block): Block[] {
@@ -813,6 +837,9 @@ function App() {
   const [metricsBySession, setMetricsBySession] = useState<Record<string, ContextMetrics>>({});
   const [usageRecords, setUsageRecords] = useState<UsageRecord[]>([]);
   const [usageLoading, setUsageLoading] = useState(false);
+  const [skills, setSkills] = useState<SkillSummary[]>([]);
+  const [skillsLoading, setSkillsLoading] = useState(false);
+  const [skillPicker, setSkillPicker] = useState<SkillPickerState | null>(null);
   const [prompt, setPrompt] = useState("");
   const [cwd, setCwd] = useState("");
   const [blockQuery, setBlockQuery] = useState("");
@@ -860,6 +887,83 @@ function App() {
       el2.selectionEnd = pos;
     });
   }, []);
+
+  const updateSkillPickerFromText = useCallback((text: string, cursor: number) => {
+    const trigger = computeSkillTrigger(text, cursor);
+    if (!trigger) {
+      setSkillPicker(null);
+      return;
+    }
+    setSkillPicker((prev) => {
+      if (!prev) return { ...trigger, selected: 0 };
+      const same = prev.start === trigger.start && prev.query === trigger.query;
+      return { ...trigger, selected: same ? prev.selected : 0 };
+    });
+  }, []);
+
+  const replacePromptRange = useCallback((start: number, end: number, replacement: string) => {
+    setPrompt((prev) => prev.slice(0, start) + replacement + prev.slice(end));
+    requestAnimationFrame(() => {
+      const el = promptRef.current;
+      if (!el) return;
+      const pos = start + replacement.length;
+      el.focus();
+      el.selectionStart = pos;
+      el.selectionEnd = pos;
+      updateSkillPickerFromText(el.value, pos);
+    });
+  }, [updateSkillPickerFromText]);
+
+  const skillMatches = useMemo(() => {
+    if (!skillPicker) return [];
+    const q = skillPicker.query.trim().toLowerCase();
+    const items = skills
+      .filter((s) => {
+        if (!q) return true;
+        const name = (s.name || "").toLowerCase();
+        const desc = (s.description || "").toLowerCase();
+        return name.includes(q) || desc.includes(q);
+      })
+      .sort((a, b) => {
+        const qLower = q;
+        const an = (a.name || "").toLowerCase();
+        const bn = (b.name || "").toLowerCase();
+        const ap = !qLower ? 0 : an.startsWith(qLower) ? 0 : an.includes(qLower) ? 1 : 2;
+        const bp = !qLower ? 0 : bn.startsWith(qLower) ? 0 : bn.includes(qLower) ? 1 : 2;
+        if (ap !== bp) return ap - bp;
+        return an.localeCompare(bn);
+      });
+    return items.slice(0, 24);
+  }, [skillPicker, skills]);
+
+  useEffect(() => {
+    if (!skillPicker) return;
+    if (skillMatches.length === 0) return;
+    if (skillPicker.selected >= 0 && skillPicker.selected < skillMatches.length) return;
+    setSkillPicker((prev) =>
+      prev ? { ...prev, selected: Math.max(0, Math.min(prev.selected, skillMatches.length - 1)) } : prev,
+    );
+  }, [skillMatches.length, skillPicker]);
+
+  const applySkill = useCallback(
+    (name: string) => {
+      if (!skillPicker) return;
+      const replacement = `$${name} `;
+      replacePromptRange(skillPicker.start, skillPicker.end, replacement);
+      setSkillPicker(null);
+    },
+    [replacePromptRange, skillPicker],
+  );
+
+  const onPromptChange = useCallback(
+    (e: ChangeEvent<HTMLTextAreaElement>) => {
+      const next = e.currentTarget.value;
+      const cursor = e.currentTarget.selectionStart ?? next.length;
+      setPrompt(next);
+      updateSkillPickerFromText(next, cursor);
+    },
+    [updateSkillPickerFromText],
+  );
 
   const blocks = useMemo(
     () => blocksBySession[activeSessionId] ?? EMPTY_BLOCKS,
@@ -1420,6 +1524,27 @@ function App() {
   }, [refreshUsageRecords]);
 
   useEffect(() => {
+    let alive = true;
+    setSkillsLoading(true);
+    void invoke<SkillSummary[]>("list_skills")
+      .then((loaded) => {
+        if (!alive) return;
+        setSkills(loaded);
+      })
+      .catch((err) => {
+        if (!alive) return;
+        setErrorBanner(`Failed to load skills: ${String(err)}`);
+      })
+      .finally(() => {
+        if (!alive) return;
+        setSkillsLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
     void invoke<Settings>("get_settings")
       .then((loaded) => {
         setSettings(loaded);
@@ -1515,6 +1640,7 @@ function App() {
     if (!promptText) return;
     stickToBottomRef.current = true;
     setErrorBanner(null);
+    setSkillPicker(null);
 
     if (!activeSessionId) {
       setPrompt("");
@@ -1831,43 +1957,155 @@ function App() {
 
 	        <div className="composer">
 	          <div className="composerLeft">
-	            <textarea
-	              className="prompt"
-	              ref={promptRef}
-	              value={prompt}
-	              onChange={(e) => setPrompt(e.currentTarget.value)}
-	              onPaste={onPromptPaste}
-	              onCompositionStart={() => {
-	                composingPromptRef.current = true;
-	              }}
-	              onCompositionEnd={() => {
-	                composingPromptRef.current = false;
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  const native = e.nativeEvent as any;
-                  if (composingPromptRef.current) return;
-                  const isComposing = Boolean(native && native.isComposing);
-                  const composingKeyCode = native && (native.keyCode === 229 || native.which === 229);
-                  if (isComposing || composingKeyCode) return;
-                  if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
-                  e.preventDefault();
-                  void runInActiveSession();
-                }
-                if (e.key === "Escape") {
-                  if (!activeSessionId) return;
-                  if (activeSession?.status !== "running") return;
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setErrorBanner(null);
-                  void invoke("stop_run", { sessionId: activeSessionId }).catch((err) =>
-                    setErrorBanner(String(err)),
-                  );
-                }
-              }}
-              rows={2}
-              placeholder="Describe what you want Codex to do…"
-            />
+              <div className="promptWrap">
+                <textarea
+                  className="prompt"
+                  ref={promptRef}
+                  value={prompt}
+                  onChange={onPromptChange}
+                  onKeyUp={(e) => {
+                    if (
+                      e.key !== "ArrowLeft" &&
+                      e.key !== "ArrowRight" &&
+                      e.key !== "ArrowUp" &&
+                      e.key !== "ArrowDown" &&
+                      e.key !== "Home" &&
+                      e.key !== "End"
+                    ) {
+                      return;
+                    }
+                    updateSkillPickerFromText(
+                      e.currentTarget.value,
+                      e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+                    );
+                  }}
+                  onClick={(e) =>
+                    updateSkillPickerFromText(
+                      e.currentTarget.value,
+                      e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+                    )
+                  }
+                  onPaste={onPromptPaste}
+                  onCompositionStart={() => {
+                    composingPromptRef.current = true;
+                  }}
+                  onCompositionEnd={() => {
+                    composingPromptRef.current = false;
+                  }}
+                  onKeyDown={(e) => {
+                    if (skillPicker) {
+                      if (e.key === "ArrowDown") {
+                        e.preventDefault();
+                        if (skillMatches.length === 0) return;
+                        setSkillPicker((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                selected: Math.min(prev.selected + 1, skillMatches.length - 1),
+                              }
+                            : prev,
+                        );
+                        return;
+                      }
+                      if (e.key === "ArrowUp") {
+                        e.preventDefault();
+                        if (skillMatches.length === 0) return;
+                        setSkillPicker((prev) =>
+                          prev
+                            ? { ...prev, selected: Math.max(0, prev.selected - 1) }
+                            : prev,
+                        );
+                        return;
+                      }
+                      if (e.key === "Escape") {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setSkillPicker(null);
+                        return;
+                      }
+                      if (e.key === "Enter" || e.key === "Tab") {
+                        const native = e.nativeEvent as any;
+                        if (composingPromptRef.current) return;
+                        const isComposing = Boolean(native && native.isComposing);
+                        const composingKeyCode =
+                          native && (native.keyCode === 229 || native.which === 229);
+                        if (isComposing || composingKeyCode) return;
+                        if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+
+                        e.preventDefault();
+                        const idx = Math.max(
+                          0,
+                          Math.min(skillPicker.selected, Math.max(0, skillMatches.length - 1)),
+                        );
+                        const choice = skillMatches[idx];
+                        if (choice) applySkill(choice.name);
+                        return;
+                      }
+                    }
+
+                    if (e.key === "Enter") {
+                      const native = e.nativeEvent as any;
+                      if (composingPromptRef.current) return;
+                      const isComposing = Boolean(native && native.isComposing);
+                      const composingKeyCode =
+                        native && (native.keyCode === 229 || native.which === 229);
+                      if (isComposing || composingKeyCode) return;
+                      if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+                      e.preventDefault();
+                      void runInActiveSession();
+                    }
+                    if (e.key === "Escape") {
+                      if (!activeSessionId) return;
+                      if (activeSession?.status !== "running") return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setErrorBanner(null);
+                      void invoke("stop_run", { sessionId: activeSessionId }).catch((err) =>
+                        setErrorBanner(String(err)),
+                      );
+                    }
+                  }}
+                  rows={2}
+                  placeholder="Describe what you want Codex to do…"
+                />
+
+                {skillPicker ? (
+                  <div className="skillPicker" role="listbox" aria-label="Skills">
+                    <div className="skillPickerHeader">
+                      <div className="skillPickerTitle mono">
+                        ${skillPicker.query || ""}
+                      </div>
+                      <div className="skillPickerHint muted mono">
+                        {skillsLoading ? "Loading…" : "enter to insert • esc to close"}
+                      </div>
+                    </div>
+                    {skillMatches.length > 0 ? (
+                      <ul className="skillList">
+                        {skillMatches.map((s, idx) => (
+                          <li
+                            key={s.name}
+                            className={`skillItem ${idx === skillPicker.selected ? "active" : ""}`}
+                            title={s.path}
+                            onMouseDown={(ev) => {
+                              ev.preventDefault();
+                              applySkill(s.name);
+                            }}
+                          >
+                            <div className="skillName mono">{s.name}</div>
+                            {s.description ? (
+                              <div className="skillDesc muted">{s.description}</div>
+                            ) : null}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="skillEmpty muted">
+                        {skillsLoading ? "Loading skills…" : "No matching skills."}
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+              </div>
             <div className="cwdRow">
               <button
                 className="cwdPill mono"

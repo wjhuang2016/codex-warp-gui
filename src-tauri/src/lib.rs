@@ -59,6 +59,13 @@ struct ShellCwd {
     cwd: String,
 }
 
+#[derive(Clone, Serialize)]
+struct SkillSummary {
+    name: String,
+    description: String,
+    path: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SessionStatus {
@@ -152,6 +159,22 @@ fn shell_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(base.join("shell"))
 }
 
+fn codex_skills_root() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("CODEX_HOME") {
+        let t = raw.trim();
+        if !t.is_empty() {
+            return Some(PathBuf::from(t).join("skills"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let t = home.trim();
+        if !t.is_empty() {
+            return Some(PathBuf::from(t).join(".codex").join("skills"));
+        }
+    }
+    None
+}
+
 fn escape_single_quotes(s: &str) -> String {
     // Wrap in single quotes and escape internal single quotes in a POSIX-compatible way.
     // Example: abc'd -> 'abc'"'"'d'
@@ -200,6 +223,85 @@ fn choose_initial_cwd(settings: &Settings, requested: Option<String>) -> Option<
         }
     }
     cwd
+}
+
+fn unquote_yaml_scalar(value: &str) -> String {
+    let t = value.trim();
+    if t.len() >= 2 {
+        let bytes = t.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if first == b'"' && last == b'"' {
+            let inner = &t[1..t.len() - 1];
+            let mut out = String::with_capacity(inner.len());
+            let mut chars = inner.chars();
+            while let Some(ch) = chars.next() {
+                if ch != '\\' {
+                    out.push(ch);
+                    continue;
+                }
+                let Some(next) = chars.next() else {
+                    break;
+                };
+                match next {
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    other => out.push(other),
+                }
+            }
+            return out.trim().to_string();
+        }
+        if first == b'\'' && last == b'\'' {
+            return t[1..t.len() - 1].trim().to_string();
+        }
+    }
+    t.to_string()
+}
+
+fn parse_skill_front_matter(text: &str) -> (Option<String>, Option<String>) {
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else {
+        return (None, None);
+    };
+    if first.trim() != "---" {
+        return (None, None);
+    }
+
+    let mut name: Option<String> = None;
+    let mut description: Option<String> = None;
+
+    for line in lines {
+        let t = line.trim();
+        if t == "---" {
+            break;
+        }
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = t.split_once(':') else {
+            continue;
+        };
+        match k.trim() {
+            "name" => {
+                let val = unquote_yaml_scalar(v);
+                if !val.is_empty() {
+                    name = Some(val);
+                }
+            }
+            "description" => {
+                let val = unquote_yaml_scalar(v);
+                if !val.is_empty() {
+                    description = Some(val);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (name, description)
 }
 
 fn stream_shell_output(
@@ -2044,6 +2146,71 @@ async fn list_usage_records(
 }
 
 #[tauri::command]
+async fn list_skills() -> Result<Vec<SkillSummary>, String> {
+    let Some(root) = codex_skills_root() else {
+        return Ok(Vec::new());
+    };
+    if tokio::fs::metadata(&root).await.is_err() {
+        return Ok(Vec::new());
+    }
+
+    let mut stack: Vec<PathBuf> = vec![root];
+    let mut out: Vec<SkillSummary> = Vec::new();
+
+    while let Some(dir) = stack.pop() {
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let ty = match entry.file_type().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if ty.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ty.is_file() {
+                continue;
+            }
+            if entry.file_name().to_string_lossy() != "SKILL.md" {
+                continue;
+            }
+
+            let text = match tokio::fs::read_to_string(&path).await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let (name, description) = parse_skill_front_matter(&text);
+            let name = name.or_else(|| {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            });
+            let Some(name) = name else {
+                continue;
+            };
+            out.push(SkillSummary {
+                name,
+                description: description.unwrap_or_default(),
+                path: path.to_string_lossy().to_string(),
+            });
+        }
+    }
+
+    let mut dedup: HashMap<String, SkillSummary> = HashMap::new();
+    for s in out {
+        dedup.entry(s.name.clone()).or_insert(s);
+    }
+    let mut skills = dedup.into_values().collect::<Vec<_>>();
+    skills.sort_by_key(|s| s.name.to_ascii_lowercase());
+    Ok(skills)
+}
+
+#[tauri::command]
 async fn rename_session(app: AppHandle, session_id: String, title: String) -> Result<(), String> {
     let dir = session_dir(&app, &session_id)?;
     let meta_path = dir.join("meta.json");
@@ -2401,6 +2568,7 @@ pub fn run() {
             read_session_stderr,
             read_conclusion,
             list_usage_records,
+            list_skills,
             rename_session,
             touch_session,
             delete_session,
