@@ -1139,8 +1139,9 @@ function App() {
       void invoke("stop_run", { sessionId: sid }).catch((err) => setErrorBanner(String(err)));
     }
 
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    // Capture to ensure Escape works even if focused widgets stop propagation (xterm, inputs, etc).
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
   }, []);
 
   useEffect(() => {
@@ -2026,6 +2027,17 @@ function App() {
                     composingPromptRef.current = false;
                   }}
                   onKeyDown={(e) => {
+                    if (e.key === "Escape" && activeSession?.status === "running" && activeSessionId) {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setErrorBanner(null);
+                      setSkillPicker(null);
+                      void invoke("stop_run", { sessionId: activeSessionId }).catch((err) =>
+                        setErrorBanner(String(err)),
+                      );
+                      return;
+                    }
+
                     if (skillPicker) {
                       if (e.key === "ArrowDown") {
                         e.preventDefault();
