@@ -364,7 +364,8 @@ function upsertBlock(blocks: Block[], next: Block): Block[] {
   };
 
   const copy = blocks.slice();
-  copy[idx] = updated;
+  copy.splice(idx, 1);
+  copy.push(updated);
   return copy;
 }
 
@@ -386,7 +387,8 @@ function appendToBlock(
     ts_ms,
   };
   const copy = blocks.slice();
-  copy[idx] = updated;
+  copy.splice(idx, 1);
+  copy.push(updated);
   return copy;
 }
 
@@ -417,7 +419,8 @@ function appendDeltaToBlock(
     ts_ms,
   };
   const copy = blocks.slice();
-  copy[idx] = updated;
+  copy.splice(idx, 1);
+  copy.push(updated);
   return copy;
 }
 
