@@ -281,6 +281,30 @@ function stripToolCitations(text: string): string {
   return text.replace(TOOL_MARKUP_RE, "");
 }
 
+const ANSI_ESCAPE_RE = /\u001b\[[0-9;]*m/g;
+const ANSI_ESCAPE_RE_ALT = /\u009b[0-9;]*m/g;
+const ANSI_ESCAPE_RE_FALLBACK = /\uFFFD\[[0-9;]*m/g;
+function stripAnsi(text: string): string {
+  if (!text) return text;
+  return text
+    .replace(ANSI_ESCAPE_RE, "")
+    .replace(ANSI_ESCAPE_RE_ALT, "")
+    .replace(ANSI_ESCAPE_RE_FALLBACK, "");
+}
+
+function parseIsoTimestampMs(text: string): number | null {
+  const cleaned = stripAnsi(text);
+  const m = cleaned.match(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.(\d+))?Z/);
+  if (!m) return null;
+  const base = m[1];
+  let frac = m[3] ?? "";
+  if (frac.length > 3) frac = frac.slice(0, 3);
+  if (frac.length > 0) frac = frac.padEnd(3, "0");
+  const iso = `${base}${frac ? `.${frac}` : ""}Z`;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 function toExternalUrl(href: string): string | null {
   const t = href.trim();
   if (!t) return null;
@@ -1347,7 +1371,10 @@ function App() {
 
         return {
           session_id: session.id,
-          ts_ms: session.created_at_ms + idx,
+          ts_ms:
+            isObject(json) && typeof (json as any)._ts_ms === "number" && Number.isFinite((json as any)._ts_ms)
+              ? Number((json as any)._ts_ms)
+              : session.created_at_ms + idx,
           stream: "stdout",
           raw,
           json,
@@ -1365,13 +1392,16 @@ function App() {
         setLastPromptBySession((prev) => ({ ...prev, [session.id]: lastPrompt }));
       }
 
-      const stderrEvents: UiEvent[] = stderrLines.map((raw, idx) => ({
-        session_id: session.id,
-        ts_ms: session.created_at_ms + lines.length + idx,
-        stream: "stderr",
-        raw,
-        json: null,
-      }));
+      const stderrEvents: UiEvent[] = stderrLines.map((raw, idx) => {
+        const parsed = parseIsoTimestampMs(raw);
+        return {
+          session_id: session.id,
+          ts_ms: parsed ?? session.created_at_ms + lines.length + idx,
+          stream: "stderr",
+          raw,
+          json: null,
+        };
+      });
 
       let nextBlocks: Block[] = [];
       for (const evt of [...events, ...stderrEvents]) {

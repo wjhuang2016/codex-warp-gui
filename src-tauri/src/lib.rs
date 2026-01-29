@@ -778,8 +778,17 @@ async fn persist_and_emit_stdout(
         }
     }
 
+    let ts_ms = now_ms();
+    let mut persisted = json.clone();
+    if let Some(obj) = persisted.as_object_mut() {
+        obj.insert(
+            "_ts_ms".to_string(),
+            serde_json::Value::Number(ts_ms.into()),
+        );
+    }
+    let line = persisted.to_string();
     events_file
-        .write_all(raw.as_bytes())
+        .write_all(line.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
     events_file
@@ -789,7 +798,7 @@ async fn persist_and_emit_stdout(
 
     let payload = UiEvent {
         session_id: session_id.to_string(),
-        ts_ms: now_ms(),
+        ts_ms,
         stream: "stdout".to_string(),
         raw: raw.to_string(),
         json: Some(json),
@@ -1714,6 +1723,7 @@ async fn start_run(
                     serde_json::json!({
                         "type": "app/error",
                         "message": error,
+                        "_ts_ms": now_ms(),
                     })
                 ),
             )
@@ -1761,6 +1771,7 @@ async fn start_run(
     let prompt_event = serde_json::json!({
         "type": "app.prompt",
         "prompt": prompt.trim(),
+        "_ts_ms": prompt_ts,
     });
     {
         use tokio::io::AsyncWriteExt;
@@ -1928,6 +1939,7 @@ async fn continue_run(
     let prompt_event = serde_json::json!({
         "type": "app.prompt",
         "prompt": prompt_text.clone(),
+        "_ts_ms": prompt_ts,
     });
     {
         use tokio::io::AsyncWriteExt;
