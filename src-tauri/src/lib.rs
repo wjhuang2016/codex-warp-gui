@@ -113,6 +113,7 @@ struct Settings {
 
 struct RunHandle {
     cancel: Option<oneshot::Sender<()>>,
+    pid: Option<u32>,
 }
 
 struct ShellHandle {
@@ -1128,6 +1129,13 @@ async fn run_turn_via_app_server(
         }
     };
 
+    if let Some(pid) = child.id() {
+        let mut locked = runs.lock().await;
+        if let Some(handle) = locked.get_mut(&session_id) {
+            handle.pid = Some(pid);
+        }
+    }
+
     let mut stdin = match child.stdin.take() {
         Some(s) => s,
         None => {
@@ -1805,6 +1813,7 @@ async fn start_run(
             session_id.clone(),
             RunHandle {
                 cancel: Some(cancel_tx),
+                pid: None,
             },
         );
     }
@@ -1973,6 +1982,7 @@ async fn continue_run(
             session_id.clone(),
             RunHandle {
                 cancel: Some(cancel_tx),
+                pid: None,
             },
         );
     }
@@ -2008,14 +2018,56 @@ async fn continue_run(
 }
 
 #[tauri::command]
-async fn stop_run(state: tauri::State<'_, AppState>, session_id: String) -> Result<(), String> {
-    let mut runs = state.runs.lock().await;
-    let Some(handle) = runs.get_mut(&session_id) else {
-        return Ok(());
+async fn stop_run(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let (cancel, pid) = {
+        let mut runs = state.runs.lock().await;
+        let Some(handle) = runs.get_mut(&session_id) else {
+            return Ok(());
+        };
+        (handle.cancel.take(), handle.pid)
     };
-    if let Some(cancel) = handle.cancel.take() {
-        let _ = cancel.send(());
+
+    let mut receiver_dropped = false;
+    if let Some(cancel) = cancel {
+        if cancel.send(()).is_err() {
+            receiver_dropped = true;
+        }
     }
+
+    if let Some(pid) = pid {
+        #[cfg(unix)]
+        unsafe {
+            // Best-effort SIGINT to stop the codex child even if the task is wedged.
+            libc::kill(pid as i32, libc::SIGINT);
+        }
+    }
+
+    if receiver_dropped {
+        // The run task likely panicked/died; clear the stale state so UI can recover.
+        {
+            let mut runs = state.runs.lock().await;
+            runs.remove(&session_id);
+        }
+        let meta_path = session_dir(&app, &session_id)?.join("meta.json");
+        if let Some(mut meta) = read_meta(&meta_path).await {
+            meta.status = SessionStatus::Error;
+            let _ = write_meta(&meta_path, &meta).await;
+        }
+        let _ = app.emit(
+            "codex_run_finished",
+            RunFinished {
+                session_id,
+                ts_ms: now_ms(),
+                exit_code: None,
+                success: false,
+            },
+        );
+    }
+
     Ok(())
 }
 
@@ -2254,7 +2306,7 @@ async fn delete_session(
     session_id: String,
 ) -> Result<(), String> {
     // Best-effort stop if it's still running.
-    let _ = stop_run(state, session_id.clone()).await;
+    let _ = stop_run(app.clone(), state, session_id.clone()).await;
 
     let dir = session_dir(&app, &session_id)?;
     tokio::fs::remove_dir_all(dir)

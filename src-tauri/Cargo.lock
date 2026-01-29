@@ -452,6 +452,7 @@ name = "codex-warp-gui"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",
