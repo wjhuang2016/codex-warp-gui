@@ -711,12 +711,14 @@ fn safe_title(prompt: &str) -> String {
     if trimmed.is_empty() {
         return "New session".to_string();
     }
-    let mut s = trimmed.replace('\n', " ");
-    if s.len() > 60 {
-        s.truncate(60);
-        s.push('…');
+    let s = trimmed.replace('\n', " ");
+    const MAX_CHARS: usize = 60;
+    if s.chars().count() <= MAX_CHARS {
+        return s;
     }
-    s
+    let mut out: String = s.chars().take(MAX_CHARS).collect();
+    out.push('…');
+    out
 }
 
 async fn write_jsonrpc_request(
