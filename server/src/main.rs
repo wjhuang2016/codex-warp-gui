@@ -1,0 +1,1666 @@
+use anyhow::Context;
+use async_stream::stream;
+use axum::{
+    extract::{Path as AxumPath, Query, State},
+    http::{HeaderMap, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
+    routing::{delete, get, post},
+    Json, Router,
+};
+use clap::Parser;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::{ChildStdin, ChildStdout, Command},
+    sync::{broadcast, oneshot, Mutex},
+    time::{timeout, Duration},
+};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tracing::info;
+use uuid::Uuid;
+
+#[derive(Parser, Debug)]
+#[command(name = "codex-warp-server")]
+struct Args {
+    /// Bind address (e.g. 0.0.0.0:8765)
+    #[arg(long, default_value = "127.0.0.1:8765")]
+    bind: String,
+
+    /// Data directory for sessions/logs (default: ~/.codex-warp)
+    #[arg(long)]
+    data_dir: Option<String>,
+
+    /// Path to codex executable (default: search PATH)
+    #[arg(long)]
+    codex_path: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionStatus {
+    Running,
+    Done,
+    Error,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SessionMeta {
+    id: String,
+    title: String,
+    created_at_ms: u64,
+    #[serde(default)]
+    last_used_at_ms: u64,
+    cwd: Option<String>,
+    status: SessionStatus,
+    codex_session_id: Option<String>,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    context_used_tokens: Option<u64>,
+    #[serde(default)]
+    context_left_pct: Option<u8>,
+    events_path: String,
+    stderr_path: String,
+    conclusion_path: String,
+}
+
+#[derive(Clone, Serialize)]
+struct UiEvent {
+    session_id: String,
+    ts_ms: u64,
+    stream: String,
+    raw: String,
+    json: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Serialize)]
+struct RunFinished {
+    session_id: String,
+    ts_ms: u64,
+    exit_code: Option<i32>,
+    success: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct ContextMetrics {
+    session_id: String,
+    ts_ms: u64,
+    context_left_pct: u8,
+    context_used_tokens: u64,
+    context_window: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct UsageRecord {
+    ts_ms: u64,
+    session_id: String,
+    thread_id: Option<String>,
+    total_tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    cached_input_tokens: u64,
+    context_window: u64,
+}
+
+struct RunHandle {
+    cancel: Option<oneshot::Sender<()>>,
+    pid: Option<u32>,
+}
+
+#[derive(Clone)]
+struct SseMessage {
+    event: &'static str,
+    data: String,
+}
+
+#[derive(Clone)]
+struct AppState {
+    data_dir: PathBuf,
+    codex_path: Option<PathBuf>,
+    runs: Arc<Mutex<HashMap<String, RunHandle>>>,
+    streams: Arc<Mutex<HashMap<String, broadcast::Sender<SseMessage>>>>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn default_data_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let t = home.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(t).join(".codex-warp"))
+}
+
+fn sessions_root(state: &AppState) -> PathBuf {
+    state.data_dir.join("sessions")
+}
+
+fn session_dir(state: &AppState, session_id: &str) -> PathBuf {
+    sessions_root(state).join(session_id)
+}
+
+fn meta_path(state: &AppState, session_id: &str) -> PathBuf {
+    session_dir(state, session_id).join("meta.json")
+}
+
+fn safe_title(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return "New session".to_string();
+    }
+    let s = trimmed.replace('\n', " ");
+    const MAX_CHARS: usize = 60;
+    if s.chars().count() <= MAX_CHARS {
+        return s;
+    }
+    let mut out: String = s.chars().take(MAX_CHARS).collect();
+    out.push('…');
+    out
+}
+
+async fn read_meta(path: &Path) -> Option<SessionMeta> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    let mut meta: SessionMeta = serde_json::from_slice(&bytes).ok()?;
+    if meta.last_used_at_ms == 0 {
+        meta.last_used_at_ms = meta.created_at_ms;
+    }
+    Some(meta)
+}
+
+async fn write_meta(path: &Path, meta: &SessionMeta) -> anyhow::Result<()> {
+    tokio::fs::write(path, serde_json::to_vec_pretty(meta).unwrap_or_default())
+        .await
+        .context("write meta.json")?;
+    Ok(())
+}
+
+async fn ensure_stream(state: &AppState, session_id: &str) -> broadcast::Sender<SseMessage> {
+    let mut locked = state.streams.lock().await;
+    if let Some(tx) = locked.get(session_id) {
+        return tx.clone();
+    }
+    let (tx, _rx) = broadcast::channel::<SseMessage>(4096);
+    locked.insert(session_id.to_string(), tx.clone());
+    tx
+}
+
+async fn broadcast_event(state: &AppState, session_id: &str, event: &'static str, data: String) {
+    let tx = ensure_stream(state, session_id).await;
+    let _ = tx.send(SseMessage { event, data });
+}
+
+async fn broadcast_ui_event(state: &AppState, payload: UiEvent) {
+    if let Ok(data) = serde_json::to_string(&payload) {
+        broadcast_event(state, &payload.session_id, "codex_event", data).await;
+    }
+}
+
+async fn broadcast_run_finished(state: &AppState, payload: RunFinished) {
+    if let Ok(data) = serde_json::to_string(&payload) {
+        broadcast_event(state, &payload.session_id, "codex_run_finished", data).await;
+    }
+}
+
+async fn broadcast_metrics(state: &AppState, payload: ContextMetrics) {
+    if let Ok(data) = serde_json::to_string(&payload) {
+        broadcast_event(state, &payload.session_id, "codex_metrics", data).await;
+    }
+}
+
+fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            return meta.permissions().mode() & 0o111 != 0;
+        }
+    }
+    true
+}
+
+fn resolve_codex_executable(state: &AppState) -> anyhow::Result<PathBuf> {
+    if let Some(p) = state.codex_path.clone() {
+        if is_executable(&p) {
+            return Ok(p);
+        }
+        anyhow::bail!("Configured codex_path is not executable: {}", p.display());
+    }
+
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            let cand = dir.join("codex");
+            if is_executable(&cand) {
+                return Ok(cand);
+            }
+        }
+    }
+
+    anyhow::bail!("codex executable not found on PATH (set --codex-path)")
+}
+
+async fn read_tail_lines(path: &Path, max_lines: usize) -> Vec<String> {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: VecDeque<String> = VecDeque::new();
+    let mut lines = BufReader::new(file).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        while out.len() >= max_lines {
+            out.pop_front();
+        }
+        out.push_back(line);
+    }
+    out.into_iter().collect()
+}
+
+async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<SessionMeta>>, StatusCode> {
+    let root = sessions_root(&state);
+    tokio::fs::create_dir_all(&root)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut sessions = Vec::new();
+    let mut rd = tokio::fs::read_dir(&root)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let ty = entry.file_type().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if !ty.is_dir() {
+            continue;
+        }
+        let mp = entry.path().join("meta.json");
+        if let Some(meta) = read_meta(&mp).await {
+            sessions.push(meta);
+        }
+    }
+
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.last_used_at_ms.max(s.created_at_ms)));
+    Ok(Json(sessions))
+}
+
+#[derive(Deserialize)]
+struct StartRequest {
+    prompt: String,
+    cwd: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+async fn start_session(
+    State(state): State<AppState>,
+    Json(req): Json<StartRequest>,
+) -> Result<Json<SessionMeta>, Response> {
+    let prompt = req.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "prompt is required").into_response());
+    }
+
+    let session_id = match req.session_id {
+        Some(raw) => Uuid::parse_str(raw.trim())
+            .map_err(|_| (StatusCode::BAD_REQUEST, "invalid session_id").into_response())?
+            .to_string(),
+        None => Uuid::new_v4().to_string(),
+    };
+
+    let dir = session_dir(&state, &session_id);
+    if tokio::fs::metadata(&dir).await.is_ok() {
+        return Err((StatusCode::CONFLICT, "session already exists").into_response());
+    }
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+
+    let created_at_ms = now_ms();
+    let last_used_at_ms = created_at_ms;
+
+    let events_path = dir.join("events.jsonl");
+    let stderr_path = dir.join("stderr.log");
+    let conclusion_path = dir.join("conclusion.md");
+
+    let cwd = req.cwd.and_then(|s| {
+        let t = s.trim().to_string();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    });
+
+    let meta = SessionMeta {
+        id: session_id.clone(),
+        title: safe_title(&prompt),
+        created_at_ms,
+        last_used_at_ms,
+        cwd: cwd.clone(),
+        status: SessionStatus::Running,
+        codex_session_id: None,
+        context_window: None,
+        context_used_tokens: None,
+        context_left_pct: None,
+        events_path: events_path.to_string_lossy().to_string(),
+        stderr_path: stderr_path.to_string_lossy().to_string(),
+        conclusion_path: conclusion_path.to_string_lossy().to_string(),
+    };
+
+    write_meta(&dir.join("meta.json"), &meta)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+
+    {
+        use tokio::io::AsyncWriteExt;
+        let ts = now_ms();
+        let prompt_event = serde_json::json!({
+            "type": "app.prompt",
+            "prompt": prompt.clone(),
+            "_ts_ms": ts,
+        });
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&events_path)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+        file.write_all(prompt_event.to_string().as_bytes())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+        file.write_all(b"\n")
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+
+        broadcast_ui_event(
+            &state,
+            UiEvent {
+                session_id: session_id.clone(),
+                ts_ms: ts,
+                stream: "stdout".to_string(),
+                raw: prompt_event.to_string(),
+                json: Some(prompt_event),
+            },
+        )
+        .await;
+    }
+
+    let codex = resolve_codex_executable(&state)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    {
+        let mut runs = state.runs.lock().await;
+        runs.insert(
+            session_id.clone(),
+            RunHandle {
+                cancel: Some(cancel_tx),
+                pid: None,
+            },
+        );
+    }
+
+    let state_for_run = state.clone();
+    let session_id_for_run = session_id.clone();
+    let events_path_for_run = events_path.clone();
+    let stderr_path_for_run = stderr_path.clone();
+    let conclusion_path_for_run = conclusion_path.clone();
+    let meta_path_for_run = dir.join("meta.json");
+    tokio::spawn(async move {
+        run_turn_via_app_server(
+            state_for_run,
+            session_id_for_run,
+            codex,
+            cwd,
+            None,
+            prompt,
+            events_path_for_run,
+            stderr_path_for_run,
+            conclusion_path_for_run,
+            meta_path_for_run,
+            cancel_rx,
+        )
+        .await;
+    });
+
+    Ok(Json(meta))
+}
+
+#[derive(Deserialize)]
+struct ContinueRequest {
+    prompt: String,
+    cwd: Option<String>,
+}
+
+async fn continue_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(req): Json<ContinueRequest>,
+) -> Result<Json<SessionMeta>, Response> {
+    let prompt = req.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "prompt is required").into_response());
+    }
+
+    {
+        let runs = state.runs.lock().await;
+        if runs.contains_key(&session_id) {
+            return Err((StatusCode::CONFLICT, "session is already running").into_response());
+        }
+    }
+
+    let dir = session_dir(&state, &session_id);
+    let meta_path = dir.join("meta.json");
+    let Some(mut meta) = read_meta(&meta_path).await else {
+        return Err((StatusCode::NOT_FOUND, "meta.json not found").into_response());
+    };
+
+    let events_path = dir.join("events.jsonl");
+    let stderr_path = dir.join("stderr.log");
+    let conclusion_path = dir.join("conclusion.md");
+
+    let cwd = req.cwd.and_then(|s| {
+        let t = s.trim().to_string();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    });
+
+    meta.status = SessionStatus::Running;
+    meta.cwd = cwd.clone().or(meta.cwd);
+    meta.last_used_at_ms = now_ms();
+    meta.events_path = events_path.to_string_lossy().to_string();
+    meta.stderr_path = stderr_path.to_string_lossy().to_string();
+    meta.conclusion_path = conclusion_path.to_string_lossy().to_string();
+
+    write_meta(&meta_path, &meta)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+
+    {
+        use tokio::io::AsyncWriteExt;
+        let ts = now_ms();
+        let prompt_event = serde_json::json!({
+            "type": "app.prompt",
+            "prompt": prompt.clone(),
+            "_ts_ms": ts,
+        });
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&events_path)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+        file.write_all(prompt_event.to_string().as_bytes())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+        file.write_all(b"\n")
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+        broadcast_ui_event(
+            &state,
+            UiEvent {
+                session_id: session_id.clone(),
+                ts_ms: ts,
+                stream: "stdout".to_string(),
+                raw: prompt_event.to_string(),
+                json: Some(prompt_event),
+            },
+        )
+        .await;
+    }
+
+    let codex = resolve_codex_executable(&state)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    {
+        let mut runs = state.runs.lock().await;
+        runs.insert(
+            session_id.clone(),
+            RunHandle {
+                cancel: Some(cancel_tx),
+                pid: None,
+            },
+        );
+    }
+
+    let state_for_run = state.clone();
+    let session_id_for_run = session_id.clone();
+    let cwd_for_run = cwd.clone().or(meta.cwd.clone());
+    let thread_id_for_run = meta.codex_session_id.clone();
+    let events_path_for_run = events_path.clone();
+    let stderr_path_for_run = stderr_path.clone();
+    let conclusion_path_for_run = conclusion_path.clone();
+    tokio::spawn(async move {
+        run_turn_via_app_server(
+            state_for_run,
+            session_id_for_run,
+            codex,
+            cwd_for_run,
+            thread_id_for_run,
+            prompt,
+            events_path_for_run,
+            stderr_path_for_run,
+            conclusion_path_for_run,
+            meta_path,
+            cancel_rx,
+        )
+        .await;
+    });
+
+    Ok(Json(meta))
+}
+
+async fn stop_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<StatusCode, Response> {
+    let (cancel, pid) = {
+        let mut runs = state.runs.lock().await;
+        let Some(handle) = runs.get_mut(&session_id) else {
+            return Ok(StatusCode::NO_CONTENT);
+        };
+        (handle.cancel.take(), handle.pid)
+    };
+
+    let mut receiver_dropped = false;
+    if let Some(cancel) = cancel {
+        if cancel.send(()).is_err() {
+            receiver_dropped = true;
+        }
+    }
+
+    if let Some(pid) = pid {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGINT);
+        }
+        #[cfg(unix)]
+        {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                unsafe {
+                    // If the PID is still alive, force-kill it.
+                    if libc::kill(pid as i32, 0) == 0 {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
+            });
+        }
+    }
+
+    if receiver_dropped {
+        {
+            let mut runs = state.runs.lock().await;
+            runs.remove(&session_id);
+        }
+        if let Some(mut meta) = read_meta(&meta_path(&state, &session_id)).await {
+            meta.status = SessionStatus::Error;
+            let _ = write_meta(&meta_path(&state, &session_id), &meta).await;
+        }
+        broadcast_run_finished(
+            &state,
+            RunFinished {
+                session_id,
+                ts_ms: now_ms(),
+                exit_code: None,
+                success: false,
+            },
+        )
+        .await;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<StatusCode, Response> {
+    let _ = stop_session(State(state.clone()), AxumPath(session_id.clone())).await;
+    let dir = session_dir(&state, &session_id);
+    tokio::fs::remove_dir_all(dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn rename_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(payload): Json<HashMap<String, String>>,
+) -> Result<StatusCode, Response> {
+    let Some(title) = payload.get("title") else {
+        return Err((StatusCode::BAD_REQUEST, "title required").into_response());
+    };
+    let mp = meta_path(&state, &session_id);
+    let Some(mut meta) = read_meta(&mp).await else {
+        return Err((StatusCode::NOT_FOUND, "meta.json not found").into_response());
+    };
+    meta.title = title.clone();
+    write_meta(&mp, &meta)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn read_conclusion(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<String, Response> {
+    let dir = session_dir(&state, &session_id);
+    let path = dir.join("conclusion.md");
+    tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+}
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    #[serde(default)]
+    tail: Option<usize>,
+}
+
+async fn stream_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+    Query(q): Query<StreamQuery>,
+    _headers: HeaderMap,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, Response>
+{
+    let dir = session_dir(&state, &session_id);
+    if tokio::fs::metadata(&dir)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "session not found").into_response())?
+        .is_dir()
+        == false
+    {
+        return Err((StatusCode::NOT_FOUND, "session not found").into_response());
+    }
+
+    let tail = q.tail.unwrap_or(4000).clamp(50, 50_000);
+    let events_path = dir.join("events.jsonl");
+    let stderr_path = dir.join("stderr.log");
+
+    let mut backlog: Vec<UiEvent> = Vec::new();
+
+    // Replay stdout events
+    for (idx, raw) in read_tail_lines(&events_path, tail).await.into_iter().enumerate() {
+        let mut json: Option<serde_json::Value> = None;
+        let mut ts_ms = now_ms();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(t) = v.get("_ts_ms").and_then(|x| x.as_u64()) {
+                ts_ms = t;
+            }
+            json = Some(v);
+        }
+        backlog.push(UiEvent {
+            session_id: session_id.clone(),
+            ts_ms,
+            stream: "stdout".to_string(),
+            raw,
+            json,
+        });
+        // ensure stable tie-break ordering
+        let _ = idx;
+    }
+
+    // Replay stderr as raw lines (timestamps may be embedded in text).
+    for raw in read_tail_lines(&stderr_path, tail).await {
+        backlog.push(UiEvent {
+            session_id: session_id.clone(),
+            ts_ms: now_ms(),
+            stream: "stderr".to_string(),
+            raw,
+            json: None,
+        });
+    }
+
+    backlog.sort_by_key(|e| e.ts_ms);
+
+    let tx = ensure_stream(&state, &session_id).await;
+    let rx = tx.subscribe();
+
+    let stream = stream! {
+        for evt in backlog {
+            if let Ok(data) = serde_json::to_string(&evt) {
+                yield Ok(Event::default().event("codex_event").data(data));
+            }
+        }
+
+        let mut live = BroadcastStream::new(rx);
+        while let Some(item) = live.next().await {
+            let Ok(msg) = item else { continue };
+            yield Ok(Event::default().event(msg.event).data(msg.data));
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keepalive")))
+}
+
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+// --- Codex app-server runner (adapted from the desktop app) ---
+
+async fn write_jsonrpc_request(
+    stdin: &mut ChildStdin,
+    id: i64,
+    method: &str,
+    params: serde_json::Value,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let msg = serde_json::json!({ "id": id, "method": method, "params": params });
+    let line = msg.to_string();
+    stdin.write_all(line.as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    Ok(())
+}
+
+async fn read_next_json_line(
+    lines: &mut tokio::io::Lines<BufReader<ChildStdout>>,
+    cancel_rx: &mut oneshot::Receiver<()>,
+) -> anyhow::Result<Option<(String, serde_json::Value)>> {
+    let next = tokio::select! {
+        _ = &mut *cancel_rx => return Err(anyhow::anyhow!("cancelled")),
+        next = lines.next_line() => next,
+    };
+
+    let Some(line) = next? else {
+        return Ok(None);
+    };
+    let json = serde_json::from_str::<serde_json::Value>(&line)?;
+    Ok(Some((line, json)))
+}
+
+fn jsonrpc_id_matches(value: &serde_json::Value, expected: i64) -> bool {
+    let Some(id) = value.get("id") else {
+        return false;
+    };
+    match id {
+        serde_json::Value::Number(n) => n.as_i64() == Some(expected),
+        serde_json::Value::String(s) => s == expected.to_string().as_str(),
+        _ => false,
+    }
+}
+
+async fn persist_and_emit_stdout(
+    state: &AppState,
+    session_id: &str,
+    events_file: &mut tokio::fs::File,
+    raw: &str,
+    json: serde_json::Value,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    if let Some(method) = json.get("method").and_then(|v| v.as_str()) {
+        if method == "thread/tokenUsage/updated"
+            || method == "account/rateLimits/updated"
+            || method == "item/reasoning/summaryPartAdded"
+            || method.starts_with("codex/event/")
+        {
+            return Ok(());
+        }
+    }
+
+    let ts_ms = now_ms();
+    let mut persisted = json.clone();
+    if let Some(obj) = persisted.as_object_mut() {
+        obj.insert("_ts_ms".to_string(), serde_json::Value::Number(ts_ms.into()));
+    }
+    events_file.write_all(persisted.to_string().as_bytes()).await?;
+    events_file.write_all(b"\n").await?;
+
+    broadcast_ui_event(
+        state,
+        UiEvent {
+            session_id: session_id.to_string(),
+            ts_ms,
+            stream: "stdout".to_string(),
+            raw: raw.to_string(),
+            json: Some(json),
+        },
+    )
+    .await;
+    Ok(())
+}
+
+fn capture_agent_message_text(
+    msg: &serde_json::Value,
+    agent_item_id: &mut Option<String>,
+    agent_text: &mut String,
+) {
+    let Some(method) = msg.get("method").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if method == "item/agentMessage/delta" {
+        let Some(params) = msg.get("params") else {
+            return;
+        };
+        let Some(item_id) = params.get("itemId").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or_default();
+        if agent_item_id.as_deref() != Some(item_id) {
+            agent_text.clear();
+            *agent_item_id = Some(item_id.to_string());
+        }
+        agent_text.push_str(delta);
+        return;
+    }
+
+    if method == "item/completed" {
+        let Some(params) = msg.get("params") else {
+            return;
+        };
+        let Some(item) = params.get("item") else {
+            return;
+        };
+        if item.get("type").and_then(|v| v.as_str()) != Some("agentMessage") {
+            return;
+        }
+        let item_id = item.get("id").and_then(|v| v.as_str());
+        let text = item.get("text").and_then(|v| v.as_str());
+        let Some(text) = text else {
+            return;
+        };
+        agent_text.clear();
+        agent_text.push_str(text);
+        *agent_item_id = item_id.map(|s| s.to_string());
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TokenUsageSnapshot {
+    window: u64,
+    total_tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    cached_input_tokens: u64,
+    pct_left: u8,
+}
+
+fn json_u64(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn extract_token_usage_snapshot(msg: &serde_json::Value) -> Option<TokenUsageSnapshot> {
+    if msg.get("method").and_then(|v| v.as_str()) != Some("thread/tokenUsage/updated") {
+        return None;
+    }
+    let params = msg.get("params")?;
+    let usage = params.get("tokenUsage")?;
+    let window = params
+        .get("modelContextWindow")
+        .and_then(json_u64)
+        .or_else(|| usage.get("modelContextWindow").and_then(json_u64))
+        .unwrap_or(0);
+    if window == 0 {
+        return None;
+    }
+    let last = usage.get("last").or_else(|| usage.get("total"))?;
+    let input_tokens = last.get("inputTokens").and_then(json_u64).unwrap_or(0);
+    let cached_input_tokens = last.get("cachedInputTokens").and_then(json_u64).unwrap_or(0);
+    let output_tokens = last.get("outputTokens").and_then(json_u64).unwrap_or(0);
+    let reasoning_output_tokens = last
+        .get("reasoningOutputTokens")
+        .and_then(json_u64)
+        .unwrap_or(0);
+    let total_tokens = last
+        .get("totalTokens")
+        .and_then(json_u64)
+        .or_else(|| {
+            let sum = input_tokens + output_tokens + reasoning_output_tokens;
+            (sum > 0).then_some(sum)
+        })
+        .unwrap_or(0);
+
+    let remaining = window.saturating_sub(total_tokens);
+    let pct_left = ((remaining.saturating_mul(100) + (window / 2)) / window).min(100) as u8;
+
+    Some(TokenUsageSnapshot {
+        window,
+        total_tokens,
+        input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        cached_input_tokens,
+        pct_left,
+    })
+}
+
+async fn persist_context_metrics(meta_path: &Path, snapshot: TokenUsageSnapshot) {
+    let Some(mut meta) = read_meta(meta_path).await else {
+        return;
+    };
+    meta.context_window = Some(snapshot.window);
+    meta.context_used_tokens = Some(snapshot.total_tokens);
+    meta.context_left_pct = Some(snapshot.pct_left);
+    let _ = write_meta(meta_path, &meta).await;
+}
+
+async fn append_usage_record(state: &AppState, record: &UsageRecord) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let path = state.data_dir.join("usage.jsonl");
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    let line = serde_json::to_string(record)?;
+    file.write_all(line.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    Ok(())
+}
+
+async fn wait_for_app_server_response(
+    state: &AppState,
+    lines: &mut tokio::io::Lines<BufReader<ChildStdout>>,
+    cancel_rx: &mut oneshot::Receiver<()>,
+    session_id: &str,
+    events_file: &mut tokio::fs::File,
+    expected_id: i64,
+    agent_item_id: &mut Option<String>,
+    agent_text: &mut String,
+) -> anyhow::Result<serde_json::Value> {
+    loop {
+        let Some((raw, json)) = read_next_json_line(lines, cancel_rx).await? else {
+            anyhow::bail!("codex app-server stdout closed");
+        };
+        if json.get("method").and_then(|v| v.as_str()).is_some() {
+            let _ = persist_and_emit_stdout(state, session_id, events_file, &raw, json.clone()).await;
+            capture_agent_message_text(&json, agent_item_id, agent_text);
+            continue;
+        }
+        if !jsonrpc_id_matches(&json, expected_id) {
+            continue;
+        }
+        if let Some(err) = json.get("error") {
+            anyhow::bail!(err.to_string());
+        }
+        let Some(result) = json.get("result") else {
+            anyhow::bail!("missing result");
+        };
+        return Ok(result.clone());
+    }
+}
+
+async fn stream_stderr(
+    state: AppState,
+    session_id: String,
+    mut reader: tokio::process::ChildStderr,
+    stderr_path: PathBuf,
+) {
+    use tokio::io::AsyncWriteExt;
+    let mut file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let mut lines = BufReader::new(&mut reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let _ = file.write_all(line.as_bytes()).await;
+        let _ = file.write_all(b"\n").await;
+        broadcast_ui_event(
+            &state,
+            UiEvent {
+                session_id: session_id.clone(),
+                ts_ms: now_ms(),
+                stream: "stderr".to_string(),
+                raw: line,
+                json: None,
+            },
+        )
+        .await;
+    }
+}
+
+async fn run_turn_via_app_server(
+    state: AppState,
+    session_id: String,
+    codex: PathBuf,
+    cwd: Option<String>,
+    thread_id: Option<String>,
+    prompt_text: String,
+    events_path: PathBuf,
+    stderr_path: PathBuf,
+    conclusion_path: PathBuf,
+    meta_path: PathBuf,
+    mut cancel_rx: oneshot::Receiver<()>,
+) {
+    async fn fail_and_finish(
+        state: &AppState,
+        session_id: String,
+        meta_path: &Path,
+        stderr_path: &Path,
+        conclusion_path: &Path,
+        error: String,
+        exit_code: Option<i32>,
+    ) {
+        let _ = tokio::fs::write(stderr_path, format!("{error}\n")).await;
+        let _ = tokio::fs::write(conclusion_path, format!("# Error\n\n{error}\n")).await;
+        if let Some(mut meta) = read_meta(meta_path).await {
+            meta.status = SessionStatus::Error;
+            let _ = write_meta(meta_path, &meta).await;
+        }
+        {
+            let mut locked = state.runs.lock().await;
+            locked.remove(&session_id);
+        }
+        broadcast_run_finished(
+            state,
+            RunFinished {
+                session_id,
+                ts_ms: now_ms(),
+                exit_code,
+                success: false,
+            },
+        )
+        .await;
+    }
+
+    let mut cmd = Command::new(codex);
+    cmd.arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(ref dir) = cwd {
+        cmd.current_dir(dir);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            fail_and_finish(
+                &state,
+                session_id,
+                &meta_path,
+                &stderr_path,
+                &conclusion_path,
+                format!("Failed to start codex app-server: {e}"),
+                Some(1),
+            )
+            .await;
+            return;
+        }
+    };
+
+    if let Some(pid) = child.id() {
+        let mut locked = state.runs.lock().await;
+        if let Some(handle) = locked.get_mut(&session_id) {
+            handle.pid = Some(pid);
+        }
+    }
+
+    let mut stdin = match child.stdin.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill().await;
+            fail_and_finish(
+                &state,
+                session_id,
+                &meta_path,
+                &stderr_path,
+                &conclusion_path,
+                "Failed to capture app-server stdin".to_string(),
+                Some(1),
+            )
+            .await;
+            return;
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill().await;
+            fail_and_finish(
+                &state,
+                session_id,
+                &meta_path,
+                &stderr_path,
+                &conclusion_path,
+                "Failed to capture app-server stdout".to_string(),
+                Some(1),
+            )
+            .await;
+            return;
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill().await;
+            fail_and_finish(
+                &state,
+                session_id,
+                &meta_path,
+                &stderr_path,
+                &conclusion_path,
+                "Failed to capture app-server stderr".to_string(),
+                Some(1),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let state_for_stderr = state.clone();
+    let session_id_for_stderr = session_id.clone();
+    let stderr_path_for_stderr = stderr_path.clone();
+    tokio::spawn(async move {
+        stream_stderr(state_for_stderr, session_id_for_stderr, stderr, stderr_path_for_stderr).await;
+    });
+
+    let mut events_file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&events_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = child.kill().await;
+            fail_and_finish(
+                &state,
+                session_id,
+                &meta_path,
+                &stderr_path,
+                &conclusion_path,
+                format!("Failed to open events.jsonl: {e}"),
+                Some(1),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let mut lines = BufReader::new(stdout).lines();
+
+    let mut next_id: i64 = 1;
+    let mut agent_item_id: Option<String> = None;
+    let mut agent_text = String::new();
+    let mut effective_thread_id = thread_id.clone();
+
+    let init_id = next_id;
+    next_id += 1;
+    if let Err(e) = write_jsonrpc_request(
+        &mut stdin,
+        init_id,
+        "initialize",
+        serde_json::json!({
+            "clientInfo": {
+                "name": "codex-warp-server",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        }),
+    )
+    .await
+    {
+        let _ = child.kill().await;
+        fail_and_finish(
+            &state,
+            session_id,
+            &meta_path,
+            &stderr_path,
+            &conclusion_path,
+            format!("Failed to send initialize request: {e}"),
+            Some(1),
+        )
+        .await;
+        return;
+    }
+
+    if let Err(e) = wait_for_app_server_response(
+        &state,
+        &mut lines,
+        &mut cancel_rx,
+        &session_id,
+        &mut events_file,
+        init_id,
+        &mut agent_item_id,
+        &mut agent_text,
+    )
+    .await
+    {
+        let _ = child.kill().await;
+        let (exit_code, error) = if e.to_string() == "cancelled" {
+            (None, "Cancelled.".to_string())
+        } else {
+            (Some(1), format!("Initialize failed: {e}"))
+        };
+        fail_and_finish(
+            &state,
+            session_id,
+            &meta_path,
+            &stderr_path,
+            &conclusion_path,
+            error,
+            exit_code,
+        )
+        .await;
+        return;
+    }
+
+    // Resume existing Codex thread if available; otherwise start a new one.
+    if let Some(existing) = thread_id.clone() {
+        let resume_id = next_id;
+        next_id += 1;
+        let _ = write_jsonrpc_request(
+            &mut stdin,
+            resume_id,
+            "thread/resume",
+            serde_json::json!({
+                "threadId": existing,
+                "cwd": cwd.clone(),
+                "config": { "skip_git_repo_check": true },
+            }),
+        )
+        .await;
+
+        match wait_for_app_server_response(
+            &state,
+            &mut lines,
+            &mut cancel_rx,
+            &session_id,
+            &mut events_file,
+            resume_id,
+            &mut agent_item_id,
+            &mut agent_text,
+        )
+        .await
+        {
+            Ok(result) => {
+                if let Some(id) = result
+                    .get("thread")
+                    .and_then(|v| v.get("id"))
+                    .and_then(|v| v.as_str())
+                {
+                    effective_thread_id = Some(id.to_string());
+                }
+            }
+            Err(e) if e.to_string() == "cancelled" => {
+                let _ = child.kill().await;
+                fail_and_finish(
+                    &state,
+                    session_id,
+                    &meta_path,
+                    &stderr_path,
+                    &conclusion_path,
+                    "Cancelled.".to_string(),
+                    None,
+                )
+                .await;
+                return;
+            }
+            Err(_) => {
+                effective_thread_id = None;
+            }
+        }
+    }
+
+    if effective_thread_id.is_none() {
+        let start_id = next_id;
+        next_id += 1;
+        let _ = write_jsonrpc_request(
+            &mut stdin,
+            start_id,
+            "thread/start",
+            serde_json::json!({
+                "cwd": cwd.clone(),
+                "config": { "skip_git_repo_check": true },
+            }),
+        )
+        .await;
+
+        match wait_for_app_server_response(
+            &state,
+            &mut lines,
+            &mut cancel_rx,
+            &session_id,
+            &mut events_file,
+            start_id,
+            &mut agent_item_id,
+            &mut agent_text,
+        )
+        .await
+        {
+            Ok(result) => {
+                if let Some(id) = result
+                    .get("thread")
+                    .and_then(|v| v.get("id"))
+                    .and_then(|v| v.as_str())
+                {
+                    effective_thread_id = Some(id.to_string());
+                }
+            }
+            Err(e) => {
+                let _ = child.kill().await;
+                let (exit_code, error) = if e.to_string() == "cancelled" {
+                    (None, "Cancelled.".to_string())
+                } else {
+                    (Some(1), format!("Thread start failed: {e}"))
+                };
+                fail_and_finish(
+                    &state,
+                    session_id,
+                    &meta_path,
+                    &stderr_path,
+                    &conclusion_path,
+                    error,
+                    exit_code,
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    let Some(thread_id) = effective_thread_id.clone() else {
+        let _ = child.kill().await;
+        fail_and_finish(
+            &state,
+            session_id,
+            &meta_path,
+            &stderr_path,
+            &conclusion_path,
+            "Thread start did not return a thread id".to_string(),
+            Some(1),
+        )
+        .await;
+        return;
+    };
+
+    if let Some(mut meta) = read_meta(&meta_path).await {
+        if meta.codex_session_id.as_deref() != Some(thread_id.as_str()) {
+            meta.codex_session_id = Some(thread_id.clone());
+            let _ = write_meta(&meta_path, &meta).await;
+        }
+    }
+
+    let turn_start_id = next_id;
+    next_id += 1;
+    let _ = write_jsonrpc_request(
+        &mut stdin,
+        turn_start_id,
+        "turn/start",
+        serde_json::json!({
+            "threadId": thread_id,
+            "input": [ { "type": "text", "text": prompt_text } ],
+        }),
+    )
+    .await;
+
+    let turn_id_for_interrupt = match wait_for_app_server_response(
+        &state,
+        &mut lines,
+        &mut cancel_rx,
+        &session_id,
+        &mut events_file,
+        turn_start_id,
+        &mut agent_item_id,
+        &mut agent_text,
+    )
+    .await
+    {
+        Ok(result) => result
+            .get("turn")
+            .and_then(|v| v.get("id"))
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.to_string()),
+                serde_json::Value::Number(n) => n.as_i64().map(|i| i.to_string()),
+                _ => None,
+            }),
+        Err(e) => {
+            let _ = child.kill().await;
+            let (exit_code, error) = if e.to_string() == "cancelled" {
+                (None, "Cancelled.".to_string())
+            } else {
+                (Some(1), format!("Turn start failed: {e}"))
+            };
+            fail_and_finish(
+                &state,
+                session_id,
+                &meta_path,
+                &stderr_path,
+                &conclusion_path,
+                error,
+                exit_code,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let mut cancelled = false;
+    let mut success = false;
+    let mut exit_code: Option<i32> = Some(1);
+    let mut last_metrics_emit_ms: u64 = 0;
+    let mut last_metrics_emitted_pct: Option<u8> = None;
+    let mut last_usage_snapshot: Option<TokenUsageSnapshot> = None;
+
+    loop {
+        let next = read_next_json_line(&mut lines, &mut cancel_rx).await;
+        let (raw, json) = match next {
+            Ok(Some(v)) => v,
+            Ok(None) => break,
+            Err(e) => {
+                cancelled = e.to_string() == "cancelled";
+                break;
+            }
+        };
+
+        let Some(method) = json.get("method").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        if method == "thread/tokenUsage/updated" {
+            if let Some(snapshot) = extract_token_usage_snapshot(&json) {
+                last_usage_snapshot = Some(snapshot);
+                if last_metrics_emitted_pct != Some(snapshot.pct_left) {
+                    let now = now_ms();
+                    if last_metrics_emit_ms == 0 || now.saturating_sub(last_metrics_emit_ms) >= 5_000 {
+                        persist_context_metrics(&meta_path, snapshot).await;
+                        broadcast_metrics(
+                            &state,
+                            ContextMetrics {
+                                session_id: session_id.clone(),
+                                ts_ms: now,
+                                context_left_pct: snapshot.pct_left,
+                                context_used_tokens: snapshot.total_tokens,
+                                context_window: snapshot.window,
+                            },
+                        )
+                        .await;
+                        last_metrics_emit_ms = now;
+                        last_metrics_emitted_pct = Some(snapshot.pct_left);
+                    }
+                }
+            }
+        }
+
+        let _ = persist_and_emit_stdout(&state, &session_id, &mut events_file, &raw, json.clone()).await;
+        capture_agent_message_text(&json, &mut agent_item_id, &mut agent_text);
+
+        if method == "turn/completed" {
+            let status = json
+                .get("params")
+                .and_then(|v| v.get("turn"))
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            success = status == "completed";
+            exit_code = if success { None } else if status == "interrupted" { None } else { Some(1) };
+            break;
+        }
+    }
+
+    if cancelled {
+        exit_code = None;
+        if let (Some(thread_id), Some(turn_id)) = (effective_thread_id.as_deref(), turn_id_for_interrupt.as_deref()) {
+            let interrupt_id = next_id;
+            let _ = write_jsonrpc_request(
+                &mut stdin,
+                interrupt_id,
+                "turn/interrupt",
+                serde_json::json!({ "threadId": thread_id, "turnId": turn_id }),
+            )
+            .await;
+        }
+        success = false;
+    }
+
+    if let Some(snapshot) = last_usage_snapshot {
+        let now = now_ms();
+        persist_context_metrics(&meta_path, snapshot).await;
+        broadcast_metrics(
+            &state,
+            ContextMetrics {
+                session_id: session_id.clone(),
+                ts_ms: now,
+                context_left_pct: snapshot.pct_left,
+                context_used_tokens: snapshot.total_tokens,
+                context_window: snapshot.window,
+            },
+        )
+        .await;
+        let _ = append_usage_record(
+            &state,
+            &UsageRecord {
+                ts_ms: now,
+                session_id: session_id.clone(),
+                thread_id: effective_thread_id.clone(),
+                total_tokens: snapshot.total_tokens,
+                input_tokens: snapshot.input_tokens,
+                output_tokens: snapshot.output_tokens,
+                reasoning_output_tokens: snapshot.reasoning_output_tokens,
+                cached_input_tokens: snapshot.cached_input_tokens,
+                context_window: snapshot.window,
+            },
+        )
+        .await;
+    }
+
+    if !agent_text.trim().is_empty() {
+        let _ = tokio::fs::write(&conclusion_path, agent_text).await;
+    }
+
+    drop(stdin);
+    match timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(_) => {}
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+
+    {
+        let mut locked = state.runs.lock().await;
+        locked.remove(&session_id);
+    }
+
+    if let Some(mut meta) = read_meta(&meta_path).await {
+        meta.status = if success { SessionStatus::Done } else { SessionStatus::Error };
+        let _ = write_meta(&meta_path, &meta).await;
+    }
+
+    broadcast_run_finished(
+        &state,
+        RunFinished {
+            session_id,
+            ts_ms: now_ms(),
+            exit_code,
+            success,
+        },
+    )
+    .await;
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,tower_http=info".into()),
+        )
+        .init();
+
+    let args = Args::parse();
+    let bind: SocketAddr = args
+        .bind
+        .parse()
+        .context("invalid --bind (expected ip:port)")?;
+
+    let data_dir = match args.data_dir {
+        Some(p) => PathBuf::from(p),
+        None => default_data_dir().context("unable to determine default data dir")?,
+    };
+    tokio::fs::create_dir_all(&data_dir)
+        .await
+        .context("create data_dir")?;
+
+    let codex_path = args
+        .codex_path
+        .and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(PathBuf::from(t)) }
+        });
+
+    let state = AppState {
+        data_dir,
+        codex_path,
+        runs: Arc::new(Mutex::new(HashMap::new())),
+        streams: Arc::new(Mutex::new(HashMap::new())),
+    };
+
+    let app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/api/sessions", get(list_sessions).post(start_session))
+        .route("/api/sessions/:id/turn", post(continue_session))
+        .route("/api/sessions/:id/stop", post(stop_session))
+        .route("/api/sessions/:id/rename", post(rename_session))
+        .route("/api/sessions/:id/conclusion", get(read_conclusion))
+        .route("/api/sessions/:id/stream", get(stream_session))
+        .route("/api/sessions/:id", delete(delete_session))
+        .layer(CorsLayer::very_permissive())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    info!("listening on http://{bind}");
+    axum::serve(tokio::net::TcpListener::bind(bind).await?, app).await?;
+    Ok(())
+}

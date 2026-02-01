@@ -26,3 +26,6 @@ dist-ssr
 # Tauri
 src-tauri/target
 src-tauri/gen
+
+# Remote server (Rust)
+server/target
