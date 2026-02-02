@@ -27,7 +27,11 @@ use tokio::{
     time::{timeout, Duration},
 };
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -45,6 +49,10 @@ struct Args {
     /// Path to codex executable (default: search PATH)
     #[arg(long)]
     codex_path: Option<String>,
+
+    /// Path to the built web UI directory (Vite `dist/`). If present, the server will host it.
+    #[arg(long)]
+    web_dist: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -115,6 +123,13 @@ struct UsageRecord {
     context_window: u64,
 }
 
+#[derive(Clone, Serialize)]
+struct SkillSummary {
+    name: String,
+    description: String,
+    path: String,
+}
+
 struct RunHandle {
     cancel: Option<oneshot::Sender<()>>,
     pid: Option<u32>,
@@ -148,6 +163,103 @@ fn default_data_dir() -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(t).join(".codex-warp"))
+}
+
+fn codex_skills_root() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("CODEX_HOME") {
+        let t = raw.trim();
+        if !t.is_empty() {
+            return Some(PathBuf::from(t).join("skills"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let t = home.trim();
+        if !t.is_empty() {
+            return Some(PathBuf::from(t).join(".codex").join("skills"));
+        }
+    }
+    None
+}
+
+fn unquote_yaml_scalar(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let bytes = t.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if first == b'"' && last == b'"' {
+            let mut out = String::with_capacity(t.len());
+            let mut chars = t[1..t.len() - 1].chars();
+            while let Some(ch) = chars.next() {
+                if ch != '\\' {
+                    out.push(ch);
+                    continue;
+                }
+                let Some(next) = chars.next() else {
+                    break;
+                };
+                match next {
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    other => out.push(other),
+                }
+            }
+            return out.trim().to_string();
+        }
+        if first == b'\'' && last == b'\'' {
+            return t[1..t.len() - 1].trim().to_string();
+        }
+    }
+    t.to_string()
+}
+
+fn parse_skill_front_matter(text: &str) -> (Option<String>, Option<String>) {
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else {
+        return (None, None);
+    };
+    if first.trim() != "---" {
+        return (None, None);
+    }
+
+    let mut name: Option<String> = None;
+    let mut description: Option<String> = None;
+
+    for line in lines {
+        let t = line.trim();
+        if t == "---" {
+            break;
+        }
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = t.split_once(':') else {
+            continue;
+        };
+        match k.trim() {
+            "name" => {
+                let val = unquote_yaml_scalar(v);
+                if !val.is_empty() {
+                    name = Some(val);
+                }
+            }
+            "description" => {
+                let val = unquote_yaml_scalar(v);
+                if !val.is_empty() {
+                    description = Some(val);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (name, description)
 }
 
 fn sessions_root(state: &AppState) -> PathBuf {
@@ -261,6 +373,9 @@ fn resolve_codex_executable(state: &AppState) -> anyhow::Result<PathBuf> {
 }
 
 async fn read_tail_lines(path: &Path, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
     let file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
         Err(_) => return Vec::new(),
@@ -677,6 +792,116 @@ async fn read_conclusion(
 }
 
 #[derive(Deserialize)]
+struct UsageQuery {
+    #[serde(default)]
+    max_records: Option<usize>,
+}
+
+async fn list_usage_records(
+    State(state): State<AppState>,
+    Query(q): Query<UsageQuery>,
+) -> Result<Json<Vec<UsageRecord>>, StatusCode> {
+    let file = match tokio::fs::File::open(state.data_dir.join("usage.jsonl")).await {
+        Ok(f) => f,
+        Err(_) => return Ok(Json(Vec::new())),
+    };
+    let max_records = q.max_records.unwrap_or(5000).clamp(1, 200_000);
+
+    let mut out: VecDeque<UsageRecord> = VecDeque::new();
+    let mut lines = BufReader::new(file).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let record = match serde_json::from_str::<UsageRecord>(&line) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        while out.len() >= max_records {
+            out.pop_front();
+        }
+        out.push_back(record);
+    }
+    Ok(Json(out.into_iter().collect()))
+}
+
+async fn list_skills() -> Result<Json<Vec<SkillSummary>>, StatusCode> {
+    let Some(root) = codex_skills_root() else {
+        return Ok(Json(Vec::new()));
+    };
+    if tokio::fs::metadata(&root).await.is_err() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let mut stack: Vec<PathBuf> = vec![root];
+    let mut out: Vec<SkillSummary> = Vec::new();
+
+    while let Some(dir) = stack.pop() {
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let ty = match entry.file_type().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if ty.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ty.is_file() {
+                continue;
+            }
+            if entry.file_name().to_string_lossy() != "SKILL.md" {
+                continue;
+            }
+
+            let text = match tokio::fs::read_to_string(&path).await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let (name, description) = parse_skill_front_matter(&text);
+            let name = name.or_else(|| {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            });
+            let Some(name) = name else {
+                continue;
+            };
+            out.push(SkillSummary {
+                name,
+                description: description.unwrap_or_default(),
+                path: path.to_string_lossy().to_string(),
+            });
+        }
+    }
+
+    let mut dedup: HashMap<String, SkillSummary> = HashMap::new();
+    for s in out {
+        dedup.entry(s.name.clone()).or_insert(s);
+    }
+    let mut skills = dedup.into_values().collect::<Vec<_>>();
+    skills.sort_by_key(|s| s.name.to_ascii_lowercase());
+    Ok(Json(skills))
+}
+
+async fn touch_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<SessionMeta>, Response> {
+    let mp = meta_path(&state, &session_id);
+    let Some(mut meta) = read_meta(&mp).await else {
+        return Err((StatusCode::NOT_FOUND, "meta.json not found").into_response());
+    };
+    meta.last_used_at_ms = now_ms();
+    write_meta(&mp, &meta)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+    Ok(Json(meta))
+}
+
+#[derive(Deserialize)]
 struct StreamQuery {
     #[serde(default)]
     tail: Option<usize>,
@@ -699,7 +924,11 @@ async fn stream_session(
         return Err((StatusCode::NOT_FOUND, "session not found").into_response());
     }
 
-    let tail = q.tail.unwrap_or(4000).clamp(50, 50_000);
+    let tail = match q.tail {
+        Some(0) => 0,
+        Some(n) => n.clamp(50, 50_000),
+        None => 4000,
+    };
     let events_path = dir.join("events.jsonl");
     let stderr_path = dir.join("stderr.log");
 
@@ -1647,9 +1876,12 @@ async fn main() -> anyhow::Result<()> {
         streams: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/api/skills", get(list_skills))
+        .route("/api/usage", get(list_usage_records))
         .route("/api/sessions", get(list_sessions).post(start_session))
+        .route("/api/sessions/:id/touch", post(touch_session))
         .route("/api/sessions/:id/turn", post(continue_session))
         .route("/api/sessions/:id/stop", post(stop_session))
         .route("/api/sessions/:id/rename", post(rename_session))
@@ -1659,6 +1891,22 @@ async fn main() -> anyhow::Result<()> {
         .layer(CorsLayer::very_permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
+
+    let web_dist = args.web_dist.map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist")
+    });
+    let index_html = web_dist.join("index.html");
+    if index_html.is_file() {
+        let serve_dir = ServeDir::new(web_dist).not_found_service(ServeFile::new(index_html));
+        app = app.fallback_service(serve_dir);
+    } else {
+        app = app.route(
+            "/",
+            get(|| async {
+                "UI not built. Run `npm run build` in the repo root to generate dist/."
+            }),
+        );
+    }
 
     info!("listening on http://{bind}");
     axum::serve(tokio::net::TcpListener::bind(bind).await?, app).await?;

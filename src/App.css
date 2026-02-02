@@ -57,6 +57,14 @@ body {
   grid-template-columns: 280px 1fr 360px;
 }
 
+.mobileBar {
+  display: none;
+}
+
+.mobileBackdrop {
+  display: none;
+}
+
 .sidebar {
   background: linear-gradient(180deg, var(--panel), var(--bg));
   border-right: 1px solid var(--border);
@@ -541,6 +549,88 @@ body {
 @media (min-width: 1700px) {
   .timelineInner {
     max-width: 1400px;
+  }
+}
+
+@media (max-width: 980px) {
+  .app {
+    grid-template-columns: 1fr;
+  }
+
+  .mobileBar {
+    display: flex;
+    gap: 8px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+
+  .mobileBar .btn {
+    padding: 9px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+  }
+
+  .mobileBackdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(31, 35, 40, 0.25);
+    backdrop-filter: blur(2px);
+    z-index: 50;
+  }
+
+  .sidebar,
+  .right {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    z-index: 60;
+    width: min(92vw, 360px);
+    box-shadow: var(--shadow);
+    transform: translateX(-110%);
+    transition: transform 160ms ease;
+  }
+
+  .right {
+    left: auto;
+    right: 0;
+    width: min(92vw, 420px);
+    transform: translateX(110%);
+    border-left: 1px solid var(--border);
+    border-right: none;
+  }
+
+  .app.mobileSessionsOpen .sidebar {
+    transform: translateX(0);
+  }
+
+  .app.mobileRightOpen .right {
+    transform: translateX(0);
+  }
+
+  .timeline {
+    padding: 14px 12px;
+  }
+
+  .timelineInner {
+    max-width: none;
+  }
+
+  .composer {
+    grid-template-columns: 1fr;
+  }
+
+  .cwdRow {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .composer .btn.primary {
+    width: 100%;
   }
 }
 

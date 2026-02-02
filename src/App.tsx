@@ -14,6 +14,11 @@ import { CwdShell } from "./CwdShell";
 import { CodeFrame } from "./CodeFrame";
 
 const EMPTY_BLOCKS: Block[] = [];
+const IS_TAURI =
+  typeof (window as any).__TAURI__ !== "undefined" ||
+  typeof (window as any).__TAURI_INTERNALS__ !== "undefined";
+
+type ConnectionMode = "local" | "remote";
 
 type Settings = {
   codex_path?: string | null;
@@ -272,6 +277,20 @@ function sortSessionsByRecency(items: SessionMeta[]): SessionMeta[] {
   return items
     .slice()
     .sort((a, b) => (b.last_used_at_ms || b.created_at_ms) - (a.last_used_at_ms || a.created_at_ms));
+}
+
+function normalizeBaseUrl(raw: string): string {
+  const t = (raw || "").trim();
+  if (!t) return "";
+  return t.replace(/\/+$/, "");
+}
+
+function joinBaseUrl(base: string, path: string): string {
+  const b = normalizeBaseUrl(base);
+  if (!b) return path;
+  if (!path) return b;
+  if (path.startsWith("/")) return `${b}${path}`;
+  return `${b}/${path}`;
 }
 
 const TOOL_MARKUP_RE = /[ \t]*\uE200[^\uE201]*\uE201/g;
@@ -847,6 +866,19 @@ function extractTodos(blocks: Block[]): TodoItem[] {
 
 function App() {
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [connectionMode, setConnectionMode] = useState<ConnectionMode>(() => {
+    const stored = localStorage.getItem("codex_warp_connection_mode");
+    if (stored === "local" || stored === "remote") return stored;
+    return IS_TAURI ? "local" : "remote";
+  });
+  const isRemote = connectionMode === "remote";
+  const [remoteBaseUrl, setRemoteBaseUrl] = useState(() =>
+    localStorage.getItem("codex_warp_remote_base_url") ?? "",
+  );
+  const [remoteBaseUrlDraft, setRemoteBaseUrlDraft] = useState("");
+  const [checkingRemote, setCheckingRemote] = useState(false);
+
+  const [mobilePanel, setMobilePanel] = useState<null | "sessions" | "right">(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showSessionSettings, setShowSessionSettings] = useState(false);
   const [showCwdShell, setShowCwdShell] = useState(false);
@@ -892,6 +924,8 @@ function App() {
   const showSettingsRef = useRef(false);
   const showSessionSettingsRef = useRef(false);
   const showRenameRef = useRef(false);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const eventSourceSessionIdRef = useRef<string | null>(null);
 
   const insertPromptText = useCallback((text: string) => {
     if (!text) return;
@@ -914,6 +948,72 @@ function App() {
       el2.selectionEnd = pos;
     });
   }, []);
+
+  const apiBaseUrl = useMemo(() => normalizeBaseUrl(remoteBaseUrl), [remoteBaseUrl]);
+  const apiUrl = useCallback((path: string) => joinBaseUrl(apiBaseUrl, path), [apiBaseUrl]);
+
+  const apiFetchJson = useCallback(
+    async <T,>(path: string, init?: RequestInit): Promise<T> => {
+      const res = await fetch(apiUrl(path), {
+        ...init,
+        headers: {
+          "content-type": "application/json",
+          ...(init?.headers || {}),
+        },
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(text || res.statusText);
+      }
+      return (await res.json()) as T;
+    },
+    [apiUrl],
+  );
+
+  const apiFetchText = useCallback(
+    async (path: string, init?: RequestInit): Promise<string> => {
+      const res = await fetch(apiUrl(path), init);
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(text || res.statusText);
+      }
+      return await res.text();
+    },
+    [apiUrl],
+  );
+
+  const apiFetchOk = useCallback(
+    async (path: string, init?: RequestInit): Promise<void> => {
+      const res = await fetch(apiUrl(path), init);
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(text || res.statusText);
+      }
+    },
+    [apiUrl],
+  );
+
+  useEffect(() => {
+    localStorage.setItem("codex_warp_connection_mode", connectionMode);
+  }, [connectionMode]);
+
+  useEffect(() => {
+    localStorage.setItem("codex_warp_remote_base_url", remoteBaseUrl);
+  }, [remoteBaseUrl]);
+
+  const stopRun = useCallback(
+    async (sessionId: string) => {
+      if (!sessionId) return;
+      if (IS_TAURI && !isRemote) {
+        await invoke("stop_run", { sessionId });
+        return;
+      }
+      await apiFetchOk(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, {
+        method: "POST",
+      });
+    },
+    [apiFetchOk, isRemote],
+  );
 
   const updateSkillPickerFromText = useCallback((text: string, cursor: number) => {
     const trigger = computeSkillTrigger(text, cursor);
@@ -1018,7 +1118,15 @@ function App() {
                 return;
               }
               setErrorBanner(null);
-              void openUrl(url).catch((err) => setErrorBanner(String(err)));
+              if (IS_TAURI) {
+                void openUrl(url).catch((err) => setErrorBanner(String(err)));
+              } else {
+                try {
+                  window.open(url, "_blank", "noopener,noreferrer");
+                } catch (err) {
+                  setErrorBanner(String(err));
+                }
+              }
             }}
           >
             {children}
@@ -1037,47 +1145,51 @@ function App() {
     showRenameRef.current = showRename;
   }, [activeSession?.status, activeSessionId, showRename, showSettings, showSessionSettings]);
 
-	  useEffect(() => {
-	    let unlisten: null | (() => void) = null;
-	    void getCurrentWindow()
-	      .onDragDropEvent((event) => {
-	        const payload: DragDropEvent = event.payload;
-	        if (payload.type !== "drop") return;
-	        if (!payload.paths?.length) return;
-	        const rawPaths = payload.paths.slice();
-	        const sid = activeSessionIdRef.current || null;
-	        setErrorBanner(null);
-	        void (async () => {
-	          try {
-	            const imported = await invoke<string[]>("import_dropped_files", {
-	              sessionId: sid,
-	              paths: rawPaths,
-	            });
-	            const next = imported.length > 0 ? imported : rawPaths;
-	            insertPromptText(next.map(quotePathIfNeeded).join("\n"));
-	          } catch (err) {
-	            setErrorBanner(String(err));
-	            insertPromptText(rawPaths.map(quotePathIfNeeded).join("\n"));
-	          }
-	        })();
-	      })
-	      .then((u) => {
-	        unlisten = u;
-	      })
+  useEffect(() => {
+    if (!IS_TAURI || isRemote) return;
+    let unlisten: null | (() => void) = null;
+    void getCurrentWindow()
+      .onDragDropEvent((event) => {
+        const payload: DragDropEvent = event.payload;
+        if (payload.type !== "drop") return;
+        if (!payload.paths?.length) return;
+        const rawPaths = payload.paths.slice();
+        const sid = activeSessionIdRef.current || null;
+        setErrorBanner(null);
+        void (async () => {
+          try {
+            const imported = await invoke<string[]>("import_dropped_files", {
+              sessionId: sid,
+              paths: rawPaths,
+            });
+            const next = imported.length > 0 ? imported : rawPaths;
+            insertPromptText(next.map(quotePathIfNeeded).join("\n"));
+          } catch (err) {
+            setErrorBanner(String(err));
+            insertPromptText(rawPaths.map(quotePathIfNeeded).join("\n"));
+          }
+        })();
+      })
+      .then((u) => {
+        unlisten = u;
+      })
       .catch(() => {});
     return () => {
       if (unlisten) unlisten();
     };
-  }, [insertPromptText]);
+  }, [insertPromptText, isRemote]);
 
   function closeSessionSettings() {
     setShowSessionSettings(false);
     setShowCwdShell(false);
-    void invoke("stop_shell").catch(() => {});
+    if (IS_TAURI && !isRemote) {
+      void invoke("stop_shell").catch(() => {});
+    }
   }
 
   const onPromptPaste = useCallback(
     async (e: ClipboardEvent<HTMLTextAreaElement>) => {
+      if (!IS_TAURI || isRemote) return;
       const items = e.clipboardData?.items;
       if (!items?.length) return;
       const images: File[] = [];
@@ -1110,7 +1222,7 @@ function App() {
         setErrorBanner(String(err));
       }
     },
-    [activeSessionId, insertPromptText],
+    [activeSessionId, insertPromptText, isRemote],
   );
 
   useEffect(() => {
@@ -1136,13 +1248,13 @@ function App() {
       if (!sid) return;
       e.preventDefault();
       setErrorBanner(null);
-      void invoke("stop_run", { sessionId: sid }).catch((err) => setErrorBanner(String(err)));
+      void stopRun(sid).catch((err) => setErrorBanner(String(err)));
     }
 
     // Capture to ensure Escape works even if focused widgets stop propagation (xterm, inputs, etc).
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, []);
+  }, [stopRun]);
 
   useEffect(() => {
     if (activeSession?.status !== "running") return;
@@ -1354,6 +1466,20 @@ function App() {
     setLoadingSessionId(loadId);
     setErrorBanner(null);
     try {
+      if (!IS_TAURI || isRemote) {
+        setBlocksBySession((prev) => ({ ...prev, [session.id]: [] }));
+        setConclusionBySession((prev) => ({ ...prev, [session.id]: "" }));
+        connectRemoteStream(session.id, 4000);
+        const conclusionText = await apiFetchText(
+          `/api/sessions/${encodeURIComponent(session.id)}/conclusion`,
+        ).catch(() => "");
+        setConclusionBySession((prev) => ({
+          ...prev,
+          [session.id]: stripToolCitations(conclusionText),
+        }));
+        return;
+      }
+
       const [lines, stderrLines, conclusionText] = await Promise.all([
         invoke<string[]>("read_session_events", { sessionId: session.id }),
         invoke<string[]>("read_session_stderr", { sessionId: session.id, maxLines: 2000 }).catch(
@@ -1424,7 +1550,10 @@ function App() {
   async function refreshSessions(nextActiveId?: string) {
     setErrorBanner(null);
     try {
-      const loaded = await invoke<SessionMeta[]>("list_sessions");
+      const loaded =
+        IS_TAURI && !isRemote
+          ? await invoke<SessionMeta[]>("list_sessions")
+          : await apiFetchJson<SessionMeta[]>("/api/sessions");
       const sorted = sortSessionsByRecency(loaded);
       setSessions(sorted);
       const active =
@@ -1444,16 +1573,166 @@ function App() {
   const refreshUsageRecords = useCallback(async () => {
     setUsageLoading(true);
     try {
-      const loaded = await invoke<UsageRecord[]>("list_usage_records", { maxRecords: 5000 });
+      const loaded =
+        IS_TAURI && !isRemote
+          ? await invoke<UsageRecord[]>("list_usage_records", { maxRecords: 5000 })
+          : await apiFetchJson<UsageRecord[]>("/api/usage?max_records=5000");
       setUsageRecords(loaded);
     } catch {
       // ignore
     } finally {
       setUsageLoading(false);
     }
+  }, [apiFetchJson, isRemote]);
+
+  const closeRemoteStream = useCallback(() => {
+    const cur = eventSourceRef.current;
+    if (cur) {
+      try {
+        cur.close();
+      } catch {
+        // ignore
+      }
+    }
+    eventSourceRef.current = null;
+    eventSourceSessionIdRef.current = null;
   }, []);
 
+  const connectRemoteStream = useCallback(
+    (sessionId: string, tail: number) => {
+      if (!sessionId) return;
+      if (!isRemote) return;
+
+      if (eventSourceSessionIdRef.current === sessionId && eventSourceRef.current) {
+        return;
+      }
+
+      closeRemoteStream();
+      const url = apiUrl(
+        `/api/sessions/${encodeURIComponent(sessionId)}/stream?tail=${encodeURIComponent(
+          String(tail),
+        )}`,
+      );
+      const es = new EventSource(url);
+      eventSourceRef.current = es;
+      eventSourceSessionIdRef.current = sessionId;
+
+      es.onopen = () => {
+        setLoadingSessionId((cur) => (cur === sessionId ? null : cur));
+      };
+
+      es.addEventListener("codex_event", (evt) => {
+        const data = (evt as MessageEvent).data;
+        if (typeof data !== "string" || !data) return;
+        let payload: UiEvent;
+        try {
+          payload = JSON.parse(data) as UiEvent;
+        } catch {
+          return;
+        }
+        if (!payload?.session_id) return;
+
+        if (isObject(payload.json) && (payload.json as any).type === "app.prompt") {
+          const p = (payload.json as any).prompt;
+          if (typeof p === "string" && p.trim()) {
+            setLastPromptBySession((prev) => ({ ...prev, [payload.session_id]: p }));
+          }
+        }
+
+        setBlocksBySession((prev) => ({
+          ...prev,
+          [payload.session_id]: applyUiEventToBlocks(prev[payload.session_id] ?? [], payload),
+        }));
+      });
+
+      es.addEventListener("codex_metrics", (evt) => {
+        const data = (evt as MessageEvent).data;
+        if (typeof data !== "string" || !data) return;
+        let payload: ContextMetrics;
+        try {
+          payload = JSON.parse(data) as ContextMetrics;
+        } catch {
+          return;
+        }
+        if (!payload?.session_id) return;
+        setMetricsBySession((prev) => ({ ...prev, [payload.session_id]: payload }));
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === payload.session_id
+              ? {
+                  ...s,
+                  context_left_pct: payload.context_left_pct,
+                  context_used_tokens: payload.context_used_tokens,
+                  context_window: payload.context_window,
+                }
+              : s,
+          ),
+        );
+      });
+
+      es.addEventListener("codex_run_finished", (evt) => {
+        const data = (evt as MessageEvent).data;
+        if (typeof data !== "string" || !data) return;
+        let payload: RunFinished;
+        try {
+          payload = JSON.parse(data) as RunFinished;
+        } catch {
+          return;
+        }
+        if (!payload?.session_id) return;
+
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === payload.session_id ? { ...s, status: payload.success ? "done" : "error" } : s,
+          ),
+        );
+        setRunStartedAtBySession((prev) => {
+          if (!(payload.session_id in prev)) return prev;
+          const next = { ...prev };
+          delete next[payload.session_id];
+          return next;
+        });
+
+        if (!payload.success && payload.session_id === activeSessionIdRef.current) {
+          const msg =
+            payload.exit_code == null ? "Run stopped." : `Run failed (exit ${payload.exit_code}).`;
+          setErrorBanner(msg);
+        }
+
+        void apiFetchText(`/api/sessions/${encodeURIComponent(payload.session_id)}/conclusion`)
+          .then((text) =>
+            setConclusionBySession((prev) => ({
+              ...prev,
+              [payload.session_id]: stripToolCitations(text),
+            })),
+          )
+          .catch(() => {});
+
+        void refreshUsageRecords();
+      });
+
+      es.onerror = () => {
+        if (activeSessionIdRef.current === sessionId) {
+          // Avoid spamming banners; only set if not already showing an error.
+          setErrorBanner((cur) => cur ?? "Lost connection to server (reconnecting…).");
+        }
+      };
+    },
+    [apiFetchText, apiUrl, closeRemoteStream, isRemote, refreshUsageRecords],
+  );
+
   useEffect(() => {
+    if (!isRemote) {
+      closeRemoteStream();
+      return;
+    }
+    return () => {
+      closeRemoteStream();
+    };
+  }, [closeRemoteStream, isRemote]);
+
+  useEffect(() => {
+    if (!IS_TAURI || isRemote) return;
     let disposed = false;
     let unlistenEvent: (() => void) | null = null;
     let unlistenFinished: (() => void) | null = null;
@@ -1537,21 +1816,35 @@ function App() {
       unlistenFinished?.();
       unlistenMetrics?.();
     };
-  }, [refreshUsageRecords]);
+  }, [isRemote, refreshUsageRecords]);
 
   useEffect(() => {
-    void invoke<SessionMeta[]>("list_sessions")
-      .then((loaded) => {
+    let alive = true;
+    setErrorBanner(null);
+    void (async () => {
+      try {
+        const loaded =
+          IS_TAURI && !isRemote
+            ? await invoke<SessionMeta[]>("list_sessions")
+            : await apiFetchJson<SessionMeta[]>("/api/sessions");
+        if (!alive) return;
         const sorted = sortSessionsByRecency(loaded);
         setSessions(sorted);
-        if (loaded.length > 0) {
-          setActiveSessionId(sorted[0].id);
-          void loadSession(sorted[0]);
+        const active = sorted[0]?.id ?? "";
+        setActiveSessionId(active);
+        if (active) {
+          const s = sorted.find((x) => x.id === active);
+          if (s) await loadSession(s);
         }
-      })
-      .catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+      } catch (e) {
+        if (!alive) return;
+        setErrorBanner(String(e));
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [apiFetchJson, isRemote]);
 
   useEffect(() => {
     void refreshUsageRecords();
@@ -1560,7 +1853,11 @@ function App() {
   useEffect(() => {
     let alive = true;
     setSkillsLoading(true);
-    void invoke<SkillSummary[]>("list_skills")
+    const p: Promise<SkillSummary[]> =
+      IS_TAURI && !isRemote
+        ? invoke<SkillSummary[]>("list_skills")
+        : apiFetchJson<SkillSummary[]>("/api/skills");
+    void p
       .then((loaded) => {
         if (!alive) return;
         setSkills(loaded);
@@ -1576,9 +1873,10 @@ function App() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [apiFetchJson, isRemote]);
 
   useEffect(() => {
+    if (!IS_TAURI || isRemote) return;
     void invoke<Settings>("get_settings")
       .then((loaded) => {
         setSettings(loaded);
@@ -1589,7 +1887,7 @@ function App() {
       })
       .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [isRemote]);
 
   async function startNewRun(promptText: string): Promise<boolean> {
     const promptTextTrimmed = promptText.trim();
@@ -1625,14 +1923,24 @@ function App() {
     setConclusionBySession((prev) => ({ ...prev, [sessionId]: "" }));
 
     try {
-      const meta = await invoke<SessionMeta>("start_run", {
-        sessionId,
-        prompt: promptTextTrimmed,
-        cwd: nextCwd,
-      });
+      const meta =
+        IS_TAURI && !isRemote
+          ? await invoke<SessionMeta>("start_run", {
+              sessionId,
+              prompt: promptTextTrimmed,
+              cwd: nextCwd,
+            })
+          : await apiFetchJson<SessionMeta>("/api/sessions", {
+              method: "POST",
+              body: JSON.stringify({
+                session_id: sessionId,
+                prompt: promptTextTrimmed,
+                cwd: nextCwd,
+              }),
+            });
       setSessions((prev) => sortSessionsByRecency(prev.map((s) => (s.id === sessionId ? meta : s))));
       setActiveSessionId(sessionId);
-      if (meta.status !== "running") {
+      if (!IS_TAURI || isRemote || meta.status !== "running") {
         void loadSession(meta);
       }
       return true;
@@ -1667,6 +1975,9 @@ function App() {
     persistScrollStateForActiveSession();
     setErrorBanner(null);
     setActiveSessionId("");
+    if (!IS_TAURI || isRemote) {
+      closeRemoteStream();
+    }
   }
 
   async function runInActiveSession() {
@@ -1689,6 +2000,9 @@ function App() {
 
     setPrompt("");
     try {
+      if (!IS_TAURI || isRemote) {
+        connectRemoteStream(activeSessionId, 0);
+      }
       const now = Date.now();
       setRunStartedAtBySession((prev) => ({ ...prev, [activeSessionId]: now }));
       setLastPromptBySession((prev) => ({ ...prev, [activeSessionId]: promptText }));
@@ -1699,11 +2013,20 @@ function App() {
             : s,
         ),
       );
-      const meta = await invoke<SessionMeta>("continue_run", {
-        sessionId: activeSessionId,
-        prompt: promptText,
-        cwd: cwd.trim() ? cwd.trim() : null,
-      });
+      const meta =
+        IS_TAURI && !isRemote
+          ? await invoke<SessionMeta>("continue_run", {
+              sessionId: activeSessionId,
+              prompt: promptText,
+              cwd: cwd.trim() ? cwd.trim() : null,
+            })
+          : await apiFetchJson<SessionMeta>(`/api/sessions/${encodeURIComponent(activeSessionId)}/turn`, {
+              method: "POST",
+              body: JSON.stringify({
+                prompt: promptText,
+                cwd: cwd.trim() ? cwd.trim() : null,
+              }),
+            });
       setSessions((prev) => sortSessionsByRecency(prev.map((s) => (s.id === meta.id ? meta : s))));
       setActiveSessionId(meta.id);
     } catch (e) {
@@ -1720,7 +2043,12 @@ function App() {
 
   async function touchSession(sessionId: string) {
     try {
-      const meta = await invoke<SessionMeta>("touch_session", { sessionId });
+      const meta =
+        IS_TAURI && !isRemote
+          ? await invoke<SessionMeta>("touch_session", { sessionId })
+          : await apiFetchJson<SessionMeta>(`/api/sessions/${encodeURIComponent(sessionId)}/touch`, {
+              method: "POST",
+            });
       setSessions((prev) => {
         let found = false;
         const next = prev.map((s) => {
@@ -1737,6 +2065,12 @@ function App() {
 
   async function pickCwd() {
     setErrorBanner(null);
+    if (!IS_TAURI || isRemote) {
+      const next = window.prompt("Working directory:", cwd.trim() || "");
+      if (next == null) return;
+      setCwd(next.trim());
+      return;
+    }
     try {
       const selected = await openDialog({
         directory: true,
@@ -1777,13 +2111,24 @@ function App() {
   async function deleteActive() {
     if (!activeSession) return;
     setErrorBanner(null);
-    const ok = await confirm(`Delete session "${activeSession.title}"?`, {
-      title: "Delete session",
-      kind: "warning",
-    });
+    const ok = IS_TAURI
+      ? await confirm(`Delete session "${activeSession.title}"?`, {
+          title: "Delete session",
+          kind: "warning",
+        })
+      : window.confirm(`Delete session "${activeSession.title}"?`);
     if (!ok) return;
     try {
-      await invoke("delete_session", { sessionId: activeSession.id });
+      if (IS_TAURI && !isRemote) {
+        await invoke("delete_session", { sessionId: activeSession.id });
+      } else {
+        if (eventSourceSessionIdRef.current === activeSession.id) {
+          closeRemoteStream();
+        }
+        await apiFetchOk(`/api/sessions/${encodeURIComponent(activeSession.id)}`, {
+          method: "DELETE",
+        });
+      }
       setBlocksBySession((prev) => {
         const next = { ...prev };
         delete next[activeSession.id];
@@ -1801,15 +2146,18 @@ function App() {
   }
 
   async function openSettings() {
-    try {
-      const loaded = await invoke<Settings>("get_settings");
-      setSettings(loaded);
-      setCodexPathDraft(loaded.codex_path ?? "");
-      setDefaultCwdDraft(loaded.default_cwd ?? "");
-      const initialCwd = loaded.last_cwd ?? loaded.default_cwd;
-      if (!cwd.trim() && initialCwd) setCwd(initialCwd);
-    } catch {
-      // ignore
+    setRemoteBaseUrlDraft(remoteBaseUrl);
+    if (IS_TAURI && !isRemote) {
+      try {
+        const loaded = await invoke<Settings>("get_settings");
+        setSettings(loaded);
+        setCodexPathDraft(loaded.codex_path ?? "");
+        setDefaultCwdDraft(loaded.default_cwd ?? "");
+        const initialCwd = loaded.last_cwd ?? loaded.default_cwd;
+        if (!cwd.trim() && initialCwd) setCwd(initialCwd);
+      } catch {
+        // ignore
+      }
     }
     setShowSettings(true);
   }
@@ -1821,6 +2169,35 @@ function App() {
     } catch (e) {
       setErrorBanner(String(e));
     }
+  }
+
+  async function checkRemoteDraft() {
+    const draft = normalizeBaseUrl(remoteBaseUrlDraft);
+    const url = draft ? `${draft}/healthz` : "/healthz";
+    setCheckingRemote(true);
+    setErrorBanner(null);
+    try {
+      const res = await fetch(url, { method: "GET" });
+      const text = await res.text().catch(() => "");
+      if (!res.ok) throw new Error(text || res.statusText);
+      if (text.trim() !== "ok") throw new Error(`Unexpected response: ${text.trim()}`);
+      setRemoteBaseUrl(draft);
+      setRemoteBaseUrlDraft(draft);
+      setConnectionMode("remote");
+    } catch (e) {
+      setErrorBanner(`Remote check failed: ${String(e)}`);
+    } finally {
+      setCheckingRemote(false);
+    }
+  }
+
+  async function saveConnectionSettings() {
+    const draft = normalizeBaseUrl(remoteBaseUrlDraft);
+    setRemoteBaseUrl(draft);
+    if (!IS_TAURI) {
+      setConnectionMode("remote");
+    }
+    setShowSettings(false);
   }
 
   async function saveSettingsDraft() {
@@ -1841,7 +2218,14 @@ function App() {
   }
 
   return (
-    <div className="app">
+    <div
+      className={`app ${mobilePanel === "sessions" ? "mobileSessionsOpen" : ""} ${
+        mobilePanel === "right" ? "mobileRightOpen" : ""
+      }`}
+    >
+      {mobilePanel ? (
+        <div className="mobileBackdrop" onClick={() => setMobilePanel(null)} />
+      ) : null}
       <aside className="sidebar">
           <div className="sidebarHeader">
             <div className="appTitle">Codex Warp</div>
@@ -1888,6 +2272,7 @@ function App() {
                 void touchSession(s.id);
                 setActiveSessionId(s.id);
                 void loadSession(s);
+                setMobilePanel(null);
               }}
             >
               <div className="sessionTitle">{s.title}</div>
@@ -1901,6 +2286,36 @@ function App() {
       </aside>
 
       <main className="main">
+        <div className="mobileBar">
+          <button
+            className="btn"
+            type="button"
+            onClick={() => setMobilePanel((cur) => (cur === "sessions" ? null : "sessions"))}
+          >
+            Sessions
+          </button>
+          <button
+            className="btn"
+            type="button"
+            onClick={() => {
+              setMobilePanel(null);
+              beginNewSession();
+            }}
+            disabled={startingSessionId != null}
+          >
+            New
+          </button>
+          <button className="btn" type="button" onClick={openSettings}>
+            Settings
+          </button>
+          <button
+            className="btn"
+            type="button"
+            onClick={() => setMobilePanel((cur) => (cur === "right" ? null : "right"))}
+          >
+            Panels
+          </button>
+        </div>
         {errorBanner ? <div className="errorBanner">{errorBanner}</div> : null}
 	        <div className="filterBar">
           <input
@@ -2032,9 +2447,7 @@ function App() {
                       e.stopPropagation();
                       setErrorBanner(null);
                       setSkillPicker(null);
-                      void invoke("stop_run", { sessionId: activeSessionId }).catch((err) =>
-                        setErrorBanner(String(err)),
-                      );
+                      void stopRun(activeSessionId).catch((err) => setErrorBanner(String(err)));
                       return;
                     }
 
@@ -2105,9 +2518,7 @@ function App() {
                       e.preventDefault();
                       e.stopPropagation();
                       setErrorBanner(null);
-                      void invoke("stop_run", { sessionId: activeSessionId }).catch((err) =>
-                        setErrorBanner(String(err)),
-                      );
+                      void stopRun(activeSessionId).catch((err) => setErrorBanner(String(err)));
                     }
                   }}
                   rows={2}
@@ -2278,50 +2689,102 @@ function App() {
             </div>
 
             <div className="field">
-              <label className="label">Codex executable path</label>
+              <label className="label">Connection</label>
+              {IS_TAURI ? (
+                <div className="row">
+                  <button
+                    className={`btn ${connectionMode === "local" ? "primary" : ""}`}
+                    type="button"
+                    onClick={() => setConnectionMode("local")}
+                  >
+                    Local
+                  </button>
+                  <button
+                    className={`btn ${connectionMode === "remote" ? "primary" : ""}`}
+                    type="button"
+                    onClick={() => setConnectionMode("remote")}
+                  >
+                    Remote
+                  </button>
+                </div>
+              ) : (
+                <div className="muted">Web mode uses a remote server.</div>
+              )}
+
+              <label className="label" style={{ marginTop: 12 }}>
+                Remote base URL
+              </label>
               <input
                 className="input"
-                value={codexPathDraft}
-                onChange={(e) => setCodexPathDraft(e.currentTarget.value)}
-                placeholder='e.g. "/opt/homebrew/bin/codex"'
+                value={remoteBaseUrlDraft}
+                onChange={(e) => setRemoteBaseUrlDraft(e.currentTarget.value)}
+                placeholder="e.g. http://127.0.0.1:8765 (leave empty for same origin)"
               />
               <div className="row">
-                <button className="btn" type="button" onClick={detectCodex}>
-                  Detect
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={checkingRemote}
+                  onClick={checkRemoteDraft}
+                  title="GET /healthz"
+                >
+                  {checkingRemote ? "Checking…" : "Check"}
                 </button>
-                <button className="btn primary" type="button" onClick={saveSettingsDraft}>
+                <button className="btn primary" type="button" onClick={saveConnectionSettings}>
                   Save
                 </button>
               </div>
-              {detectedCodexPaths.length > 0 ? (
-                <div className="detected">
-                  <div className="muted">Detected:</div>
-                  <ul>
-                    {detectedCodexPaths.map((p) => (
-                      <li key={p}>
-                        <button
-                          className="linkBtn mono"
-                          type="button"
-                          onClick={() => setCodexPathDraft(p)}
-                        >
-                          {p}
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ) : null}
             </div>
 
-            <div className="field">
-              <label className="label">Default working directory</label>
-              <input
-                className="input"
-                value={defaultCwdDraft}
-                onChange={(e) => setDefaultCwdDraft(e.currentTarget.value)}
-                placeholder='e.g. "/Users/you/projects"'
-              />
-            </div>
+            {IS_TAURI && !isRemote ? (
+              <>
+                <div className="field">
+                  <label className="label">Codex executable path</label>
+                  <input
+                    className="input"
+                    value={codexPathDraft}
+                    onChange={(e) => setCodexPathDraft(e.currentTarget.value)}
+                    placeholder='e.g. "/opt/homebrew/bin/codex"'
+                  />
+                  <div className="row">
+                    <button className="btn" type="button" onClick={detectCodex}>
+                      Detect
+                    </button>
+                    <button className="btn primary" type="button" onClick={saveSettingsDraft}>
+                      Save
+                    </button>
+                  </div>
+                  {detectedCodexPaths.length > 0 ? (
+                    <div className="detected">
+                      <div className="muted">Detected:</div>
+                      <ul>
+                        {detectedCodexPaths.map((p) => (
+                          <li key={p}>
+                            <button
+                              className="linkBtn mono"
+                              type="button"
+                              onClick={() => setCodexPathDraft(p)}
+                            >
+                              {p}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="field">
+                  <label className="label">Default working directory</label>
+                  <input
+                    className="input"
+                    value={defaultCwdDraft}
+                    onChange={(e) => setDefaultCwdDraft(e.currentTarget.value)}
+                    placeholder='e.g. "/Users/you/projects"'
+                  />
+                </div>
+              </>
+            ) : null}
           </div>
         </div>
       ) : null}
@@ -2368,7 +2831,9 @@ function App() {
                 const open = (e.currentTarget as HTMLDetailsElement).open;
                 setShowCwdShell(open);
                 if (!open) {
-                  void invoke("stop_shell").catch(() => {});
+                  if (IS_TAURI && !isRemote) {
+                    void invoke("stop_shell").catch(() => {});
+                  }
                 }
               }}
             >
@@ -2426,7 +2891,18 @@ function App() {
                     setErrorBanner(null);
                     setRenameSaving(true);
                     try {
-                      await invoke("rename_session", { sessionId: activeSessionId, title });
+                      if (IS_TAURI && !isRemote) {
+                        await invoke("rename_session", { sessionId: activeSessionId, title });
+                      } else {
+                        await apiFetchOk(
+                          `/api/sessions/${encodeURIComponent(activeSessionId)}/rename`,
+                          {
+                            method: "POST",
+                            headers: { "content-type": "application/json" },
+                            body: JSON.stringify({ title }),
+                          },
+                        );
+                      }
                       setShowRename(false);
                       await refreshSessions(activeSessionId);
                     } catch (e) {
