@@ -462,6 +462,18 @@ function hasRecentPromptBlock(blocks: Block[], text: string): boolean {
   return false;
 }
 
+function hasRecentThoughtBlock(blocks: Block[], text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return true;
+  const start = Math.max(0, blocks.length - 8);
+  for (let i = blocks.length - 1; i >= start; i -= 1) {
+    const b = blocks[i];
+    if (b.kind !== "thought") continue;
+    if ((b.body || "").trim() === t) return true;
+  }
+  return false;
+}
+
 function runActivityTextFromJson(json: unknown): string | null {
   if (!isObject(json)) return null;
   const method = typeof (json as any).method === "string" ? String((json as any).method) : "";
@@ -789,8 +801,24 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
     const payload = (e.json as any).payload as any;
     const pType = typeof payload.type === "string" ? String(payload.type) : "";
     if (!pType) return blocks;
-    if (pType === "token_count" || pType === "agent_message" || pType === "agent_reasoning") {
+    if (pType === "token_count" || pType === "agent_message") {
       return blocks;
+    }
+    if (pType === "agent_reasoning") {
+      const text = stripToolCitations(typeof payload.text === "string" ? String(payload.text) : "");
+      if (!text.trim()) return blocks;
+      if (hasRecentThoughtBlock(blocks, text)) return blocks;
+      return [
+        ...blocks,
+        {
+          id: newId(),
+          key: `rollout:agent_reasoning:${e.ts_ms}:${Math.random()}`,
+          kind: "thought",
+          title: "Thought",
+          body: text,
+          ts_ms: e.ts_ms,
+        },
+      ];
     }
     if (pType === "user_message") {
       const message = stripToolCitations(
@@ -876,6 +904,7 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
       }
       const text = stripToolCitations(parts.join("\n\n"));
       if (!text.trim()) return blocks;
+      if (hasRecentThoughtBlock(blocks, text)) return blocks;
       return [
         ...blocks,
         {
