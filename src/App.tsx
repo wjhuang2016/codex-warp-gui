@@ -388,6 +388,9 @@ type ProjectGroup = {
   lastUsedAt: number;
 };
 
+const THREADS_PAGE_SIZE = 30;
+const THREADS_SCROLL_THRESHOLD_PX = 140;
+
 type SkillPickerState = {
   start: number;
   end: number;
@@ -960,6 +963,7 @@ function App() {
   const [activeProjectKey, setActiveProjectKey] = useState(() => {
     return localStorage.getItem("codex_warp_active_project") ?? "all";
   });
+  const [threadsLimitByProject, setThreadsLimitByProject] = useState<Record<string, number>>({});
   const [skillPicker, setSkillPicker] = useState<SkillPickerState | null>(null);
   const [prompt, setPrompt] = useState("");
   const [cwd, setCwd] = useState("");
@@ -976,6 +980,7 @@ function App() {
   const promptRef = useRef<HTMLTextAreaElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
+  const threadListRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const composingPromptRef = useRef(false);
   const scrollStateBySessionRef = useRef<
@@ -1217,6 +1222,37 @@ function App() {
     if (activeProjectKey === "all") return sessions;
     return sessions.filter((s) => projectFromCwd(s.cwd).key === activeProjectKey);
   }, [activeProjectKey, sessions]);
+
+  useEffect(() => {
+    setThreadsLimitByProject((prev) => {
+      if (prev[activeProjectKey] != null) return prev;
+      const initial = Math.min(THREADS_PAGE_SIZE, sessionsForActiveProject.length || THREADS_PAGE_SIZE);
+      return { ...prev, [activeProjectKey]: initial };
+    });
+    // We only care about length for initialization.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProjectKey]);
+
+  const visibleThreadsLimit = threadsLimitByProject[activeProjectKey] ?? THREADS_PAGE_SIZE;
+  const visibleSessionsForActiveProject = useMemo(() => {
+    if (visibleThreadsLimit <= 0) return [];
+    return sessionsForActiveProject.slice(0, visibleThreadsLimit);
+  }, [sessionsForActiveProject, visibleThreadsLimit]);
+  const hasMoreThreads = visibleSessionsForActiveProject.length < sessionsForActiveProject.length;
+
+  const onThreadListScroll = useCallback(() => {
+    const el = threadListRef.current;
+    if (!el) return;
+    if (!hasMoreThreads) return;
+    const remaining = el.scrollHeight - (el.scrollTop + el.clientHeight);
+    if (remaining > THREADS_SCROLL_THRESHOLD_PX) return;
+    setThreadsLimitByProject((prev) => {
+      const cur = prev[activeProjectKey] ?? THREADS_PAGE_SIZE;
+      const next = Math.min(cur + THREADS_PAGE_SIZE, sessionsForActiveProject.length);
+      if (next <= cur) return prev;
+      return { ...prev, [activeProjectKey]: next };
+    });
+  }, [activeProjectKey, hasMoreThreads, sessionsForActiveProject.length]);
 
   const markdownComponents: Components = useMemo(
     () => ({
@@ -2467,8 +2503,8 @@ function App() {
         <div className="sidebarSectionTitle">
           Threads <span className="muted mono">{activeProjectLabel}</span>
         </div>
-        <div className="sessionList">
-          {sessionsForActiveProject.map((s) => (
+        <div className="sessionList" ref={threadListRef} onScroll={onThreadListScroll}>
+          {visibleSessionsForActiveProject.map((s) => (
             <button
               key={s.id}
               type="button"
@@ -2488,6 +2524,9 @@ function App() {
               </div>
             </button>
           ))}
+          {hasMoreThreads ? (
+            <div className="sessionListFooter muted mono">Scroll to load more…</div>
+          ) : null}
         </div>
       </aside>
 
