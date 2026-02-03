@@ -420,6 +420,48 @@ function previewText(text: string): string {
   return `${first.slice(0, max)}…`;
 }
 
+function extractRolloutContentText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const item of content) {
+    if (!isObject(item)) continue;
+    const t = typeof (item as any).type === "string" ? String((item as any).type) : "";
+    if (t !== "input_text" && t !== "output_text") continue;
+    const text = typeof (item as any).text === "string" ? String((item as any).text) : "";
+    if (text) parts.push(text);
+  }
+  return parts.join("");
+}
+
+function shouldShowRolloutUserText(text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return false;
+  if (t.startsWith("# AGENTS.md")) return false;
+  if (t.startsWith("<environment_context")) return false;
+  if (t.includes("<INSTRUCTIONS>")) return false;
+  return true;
+}
+
+function parseExitCodeFromToolOutput(output: string): number | null {
+  const m = output.match(/Exit code:\s*(\d+)/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+function hasRecentPromptBlock(blocks: Block[], text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return true;
+  const start = Math.max(0, blocks.length - 8);
+  for (let i = blocks.length - 1; i >= start; i -= 1) {
+    const b = blocks[i];
+    if (b.kind !== "status") continue;
+    if (b.title !== "Prompt") continue;
+    if ((b.body || "").trim() === t) return true;
+  }
+  return false;
+}
+
 function runActivityTextFromJson(json: unknown): string | null {
   if (!isObject(json)) return null;
   const method = typeof (json as any).method === "string" ? String((json as any).method) : "";
@@ -736,6 +778,168 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
         ts_ms: e.ts_ms,
       },
     ];
+  }
+
+  // Codex native rollout JSONL ("~/.codex/sessions/**/rollout-*.jsonl")
+  if (type === "session_meta" || type === "turn_context") {
+    return blocks;
+  }
+
+  if (type === "event_msg" && isObject((e.json as any).payload)) {
+    const payload = (e.json as any).payload as any;
+    const pType = typeof payload.type === "string" ? String(payload.type) : "";
+    if (!pType) return blocks;
+    if (pType === "token_count" || pType === "agent_message" || pType === "agent_reasoning") {
+      return blocks;
+    }
+    if (pType === "user_message") {
+      const message = stripToolCitations(
+        typeof payload.message === "string" ? String(payload.message) : "",
+      );
+      if (!message.trim()) return blocks;
+      if (hasRecentPromptBlock(blocks, message)) return blocks;
+      const key = `rollout:user_message:${e.ts_ms}`;
+      return upsertBlock(blocks, {
+        id: key,
+        key,
+        kind: "status",
+        title: "Prompt",
+        body: message,
+        ts_ms: e.ts_ms,
+      });
+    }
+    if (pType === "error") {
+      const message = typeof payload.message === "string" ? String(payload.message) : "";
+      if (!message.trim()) return blocks;
+      return [
+        ...blocks,
+        {
+          id: newId(),
+          key: `rollout:error:${e.ts_ms}:${Math.random()}`,
+          kind: "error",
+          title: "Error",
+          body: message,
+          ts_ms: e.ts_ms,
+        },
+      ];
+    }
+    return blocks;
+  }
+
+  if (type === "response_item" && isObject((e.json as any).payload)) {
+    const payload = (e.json as any).payload as any;
+    const pType = typeof payload.type === "string" ? String(payload.type) : "";
+    if (!pType) return blocks;
+
+    if (pType === "message") {
+      const role = typeof payload.role === "string" ? String(payload.role) : "";
+      if (role === "assistant") {
+        const text = stripToolCitations(extractRolloutContentText(payload.content));
+        if (!text.trim()) return blocks;
+        return [
+          ...blocks,
+          {
+            id: newId(),
+            key: `rollout:assistant:${e.ts_ms}:${Math.random()}`,
+            kind: "assistant",
+            title: "Assistant",
+            body: text,
+            ts_ms: e.ts_ms,
+          },
+        ];
+      }
+      if (role === "user") {
+        const text = stripToolCitations(extractRolloutContentText(payload.content));
+        if (!shouldShowRolloutUserText(text)) return blocks;
+        if (hasRecentPromptBlock(blocks, text)) return blocks;
+        const key = `rollout:user:${e.ts_ms}`;
+        return upsertBlock(blocks, {
+          id: key,
+          key,
+          kind: "status",
+          title: "Prompt",
+          body: text,
+          ts_ms: e.ts_ms,
+        });
+      }
+      return blocks;
+    }
+
+    if (pType === "reasoning") {
+      const summary = Array.isArray(payload.summary) ? payload.summary : [];
+      const parts: string[] = [];
+      for (const item of summary) {
+        if (!isObject(item)) continue;
+        if (String((item as any).type) !== "summary_text") continue;
+        const text = typeof (item as any).text === "string" ? String((item as any).text) : "";
+        if (text) parts.push(text);
+      }
+      const text = stripToolCitations(parts.join("\n\n"));
+      if (!text.trim()) return blocks;
+      return [
+        ...blocks,
+        {
+          id: newId(),
+          key: `rollout:reasoning:${e.ts_ms}:${Math.random()}`,
+          kind: "thought",
+          title: "Thought",
+          body: text,
+          ts_ms: e.ts_ms,
+        },
+      ];
+    }
+
+    if (pType === "function_call") {
+      const callId = typeof payload.call_id === "string" ? String(payload.call_id) : "";
+      const tool = typeof payload.name === "string" ? String(payload.name) : "tool";
+      const argsRaw = typeof payload.arguments === "string" ? String(payload.arguments) : "";
+      let subtitle: string | undefined;
+      if (argsRaw) {
+        try {
+          const parsed = JSON.parse(argsRaw) as any;
+          const cmd = typeof parsed?.command === "string" ? String(parsed.command) : "";
+          const wd = typeof parsed?.workdir === "string" ? String(parsed.workdir) : "";
+          if (cmd) subtitle = summarizeCommand(cmd);
+          if (wd && subtitle) subtitle = `${subtitle} • ${wd}`;
+          if (!subtitle && wd) subtitle = wd;
+        } catch {
+          // ignore
+        }
+      }
+      const key = callId ? `call:${callId}` : `call:${e.ts_ms}:${Math.random()}`;
+      return upsertBlock(blocks, {
+        id: key,
+        key,
+        kind: "command",
+        title: tool === "shell_command" ? "Command" : `Tool: ${tool}`,
+        subtitle,
+        body: "",
+        ts_ms: e.ts_ms,
+        status: "in_progress",
+      });
+    }
+
+    if (pType === "function_call_output") {
+      const callId = typeof payload.call_id === "string" ? String(payload.call_id) : "";
+      const output = stripToolCitations(typeof payload.output === "string" ? String(payload.output) : "");
+      if (!output.trim()) return blocks;
+      const key = callId ? `call:${callId}` : `call:${e.ts_ms}:${Math.random()}`;
+      const exitCode = parseExitCodeFromToolOutput(output);
+      const status = exitCode == null ? "completed" : exitCode === 0 ? "completed" : "failed";
+      const autoCollapse = output.length > 1400 ? true : undefined;
+      return upsertBlock(blocks, {
+        id: key,
+        key,
+        kind: "command",
+        title: "Command",
+        body: output,
+        ts_ms: e.ts_ms,
+        status,
+        collapsed: autoCollapse,
+      });
+    }
+
+    return blocks;
   }
 
   if (type === "app.prompt") {
@@ -1830,6 +2034,32 @@ function App() {
           const p = (payload.json as any).prompt;
           if (typeof p === "string" && p.trim()) {
             setLastPromptBySession((prev) => ({ ...prev, [payload.session_id]: p }));
+          }
+        }
+
+        if (isObject(payload.json) && (payload.json as any).type === "event_msg") {
+          const p = isObject((payload.json as any).payload) ? ((payload.json as any).payload as any) : null;
+          const pType = p && typeof p.type === "string" ? String(p.type) : "";
+          if (pType === "user_message" && typeof p.message === "string" && p.message.trim()) {
+            setLastPromptBySession((prev) => ({ ...prev, [payload.session_id]: String(p.message) }));
+          }
+          if (pType === "token_count") {
+            const info = p && isObject(p.info) ? (p.info as any) : null;
+            const total = info?.total_token_usage?.total_tokens;
+            const window = info?.model_context_window;
+            if (typeof total === "number" && typeof window === "number" && window > 0) {
+              const pct = Math.max(0, Math.min(100, Math.round(((window - total) / window) * 100)));
+              setMetricsBySession((prev) => ({
+                ...prev,
+                [payload.session_id]: {
+                  session_id: payload.session_id,
+                  ts_ms: payload.ts_ms,
+                  context_left_pct: pct,
+                  context_used_tokens: Math.max(0, Math.floor(total)),
+                  context_window: Math.max(0, Math.floor(window)),
+                },
+              }));
+            }
           }
         }
 

@@ -50,6 +50,10 @@ struct Args {
     #[arg(long)]
     codex_path: Option<String>,
 
+    /// Codex home directory for reading native sessions (default: $CODEX_HOME or ~/.codex)
+    #[arg(long)]
+    codex_home: Option<String>,
+
     /// Path to the built web UI directory (Vite `dist/`). If present, the server will host it.
     #[arg(long)]
     web_dist: Option<String>,
@@ -145,8 +149,17 @@ struct SseMessage {
 struct AppState {
     data_dir: PathBuf,
     codex_path: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
     runs: Arc<Mutex<HashMap<String, RunHandle>>>,
     streams: Arc<Mutex<HashMap<String, broadcast::Sender<SseMessage>>>>,
+    native_cache: Arc<Mutex<NativeCache>>,
+}
+
+#[derive(Clone)]
+struct NativeCache {
+    built_at_ms: u64,
+    rollouts_by_session: HashMap<String, Vec<PathBuf>>,
+    cwd_by_session: HashMap<String, Option<String>>,
 }
 
 fn now_ms() -> u64 {
@@ -163,6 +176,21 @@ fn default_data_dir() -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(t).join(".codex-warp"))
+}
+
+fn default_codex_home() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("CODEX_HOME") {
+        let t = raw.trim();
+        if !t.is_empty() {
+            return Some(PathBuf::from(t));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    let t = home.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(t).join(".codex"))
 }
 
 fn codex_skills_root() -> Option<PathBuf> {
@@ -391,13 +419,326 @@ async fn read_tail_lines(path: &Path, max_lines: usize) -> Vec<String> {
     out.into_iter().collect()
 }
 
+#[derive(Deserialize)]
+struct CodexHistoryLine {
+    session_id: String,
+    ts: i64,
+    text: String,
+}
+
+#[derive(Clone)]
+struct CodexHistoryAgg {
+    first_ts_ms: u64,
+    last_ts_ms: u64,
+    last_text: String,
+}
+
+fn parse_rollout_session_id(file_name: &str) -> Option<String> {
+    if !file_name.starts_with("rollout-") || !file_name.ends_with(".jsonl") {
+        return None;
+    }
+    let base = &file_name["rollout-".len()..file_name.len() - ".jsonl".len()];
+    if base.len() <= 20 {
+        return None;
+    }
+    // "YYYY-MM-DDTHH-MM-SS-<session_id>"
+    if base.as_bytes().get(19) != Some(&b'-') {
+        return None;
+    }
+    let id = base[20..].trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn scan_codex_rollouts(root: &Path) -> HashMap<String, Vec<PathBuf>> {
+    let mut out: HashMap<String, Vec<PathBuf>> = HashMap::new();
+
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let ty = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if ty.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ty.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(session_id) = parse_rollout_session_id(&name) else {
+                continue;
+            };
+            out.entry(session_id).or_default().push(path);
+        }
+    }
+
+    for paths in out.values_mut() {
+        paths.sort_by_key(|p| p.file_name().map(|s| s.to_string_lossy().to_string()));
+    }
+
+    out
+}
+
+async fn ensure_native_cache(state: &AppState) {
+    let Some(codex_home) = state.codex_home.clone() else {
+        return;
+    };
+
+    {
+        let locked = state.native_cache.lock().await;
+        if locked.built_at_ms > 0 && locked.built_at_ms.saturating_add(3_000) > now_ms() {
+            return;
+        }
+    }
+
+    let codex_home_for_scan = codex_home.clone();
+    let scanned = tokio::task::spawn_blocking(move || {
+        let mut merged: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let sessions_dir = codex_home_for_scan.join("sessions");
+        if sessions_dir.is_dir() {
+            merged.extend(scan_codex_rollouts(&sessions_dir));
+        }
+        let archived_dir = codex_home_for_scan.join("archived_sessions");
+        if archived_dir.is_dir() {
+            for (k, v) in scan_codex_rollouts(&archived_dir) {
+                merged.entry(k).or_default().extend(v);
+            }
+        }
+        for paths in merged.values_mut() {
+            paths.sort_by_key(|p| p.file_name().map(|s| s.to_string_lossy().to_string()));
+        }
+        merged
+    })
+    .await
+    .unwrap_or_default();
+
+    {
+        let mut locked = state.native_cache.lock().await;
+        locked.built_at_ms = now_ms();
+        locked.rollouts_by_session = scanned;
+        locked.cwd_by_session.clear();
+    }
+}
+
+async fn read_prefix(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buf = vec![0u8; max_bytes];
+    let n = file.read(&mut buf).await?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+fn extract_json_string_field(prefix: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\":\"", key);
+    let start = prefix.find(&needle)? + needle.len();
+    let mut out = String::new();
+    let mut chars = prefix[start..].chars();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            return Some(out);
+        }
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let Some(next) = chars.next() else {
+            break;
+        };
+        match next {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            '\\' => out.push('\\'),
+            '"' => out.push('"'),
+            'u' => {
+                let mut hex = String::new();
+                for _ in 0..4 {
+                    let Some(h) = chars.next() else {
+                        break;
+                    };
+                    hex.push(h);
+                }
+                if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                    if let Some(c) = char::from_u32(code) {
+                        out.push(c);
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+async fn extract_cwd_from_rollout(path: &Path) -> Option<String> {
+    let prefix = read_prefix(path, 8_192).await.ok()?;
+    let text = String::from_utf8_lossy(&prefix);
+    extract_json_string_field(&text, "cwd")
+}
+
+async fn file_mtime_ms(path: &Path) -> Option<u64> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    let m = meta.modified().ok()?;
+    let dur = m.duration_since(UNIX_EPOCH).ok()?;
+    Some(dur.as_millis() as u64)
+}
+
+fn load_codex_history(codex_home: &Path) -> HashMap<String, CodexHistoryAgg> {
+    use std::io::BufRead;
+
+    let mut out: HashMap<String, CodexHistoryAgg> = HashMap::new();
+    let path = codex_home.join("history.jsonl");
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return out,
+    };
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().flatten() {
+        let rec: CodexHistoryLine = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if rec.session_id.trim().is_empty() {
+            continue;
+        }
+        let ts_ms = rec.ts.max(0) as u64 * 1000;
+        out.entry(rec.session_id.clone())
+            .and_modify(|a| {
+                a.first_ts_ms = a.first_ts_ms.min(ts_ms);
+                if ts_ms >= a.last_ts_ms {
+                    a.last_ts_ms = ts_ms;
+                    a.last_text = rec.text.clone();
+                }
+            })
+            .or_insert_with(|| CodexHistoryAgg {
+                first_ts_ms: ts_ms,
+                last_ts_ms: ts_ms,
+                last_text: rec.text.clone(),
+            });
+    }
+    out
+}
+
+fn load_codex_thread_titles(codex_home: &Path) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let path = codex_home.join(".codex-global-state.json");
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return out,
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    let Some(obj) = value
+        .get("thread-titles")
+        .and_then(|v| v.get("titles"))
+        .and_then(|v| v.as_object())
+    else {
+        return out;
+    };
+    for (k, v) in obj {
+        let Some(title) = v.as_str() else {
+            continue;
+        };
+        if !k.trim().is_empty() && !title.trim().is_empty() {
+            out.insert(k.clone(), title.trim().to_string());
+        }
+    }
+    out
+}
+
+async fn native_session_meta(state: &AppState, session_id: &str) -> Option<SessionMeta> {
+    let codex_home = state.codex_home.clone()?;
+    ensure_native_cache(state).await;
+
+    let (paths, cached_cwd) = {
+        let locked = state.native_cache.lock().await;
+        (
+            locked.rollouts_by_session.get(session_id).cloned(),
+            locked.cwd_by_session.get(session_id).cloned().flatten(),
+        )
+    };
+    let paths = paths?;
+    if paths.is_empty() {
+        return None;
+    }
+    let earliest_path = paths.first().cloned().unwrap_or_else(|| PathBuf::from(""));
+    let latest_path = paths.last().cloned().unwrap_or_else(|| PathBuf::from(""));
+
+    let cwd = if cached_cwd.is_some() {
+        cached_cwd
+    } else {
+        let computed = extract_cwd_from_rollout(&latest_path).await;
+        let mut locked = state.native_cache.lock().await;
+        locked
+            .cwd_by_session
+            .insert(session_id.to_string(), computed.clone());
+        computed
+    };
+
+    let session_id_owned = session_id.to_string();
+    let (history, titles) = tokio::task::spawn_blocking(move || {
+        (
+            load_codex_history(&codex_home),
+            load_codex_thread_titles(&codex_home),
+        )
+    })
+    .await
+    .unwrap_or_default();
+
+    let hist = history.get(&session_id_owned);
+    let created_at_ms = match hist {
+        Some(h) => h.first_ts_ms,
+        None => file_mtime_ms(&earliest_path).await.unwrap_or_else(now_ms),
+    };
+    let last_used_at_ms = match hist {
+        Some(h) => h.last_ts_ms,
+        None => file_mtime_ms(&latest_path).await.unwrap_or_else(now_ms),
+    };
+
+    let title = titles
+        .get(&session_id_owned)
+        .cloned()
+        .or_else(|| hist.map(|h| safe_title(&h.last_text)))
+        .unwrap_or_else(|| format!("Session {session_id}"));
+
+    Some(SessionMeta {
+        id: session_id_owned.clone(),
+        title,
+        created_at_ms,
+        last_used_at_ms,
+        cwd,
+        status: SessionStatus::Done,
+        codex_session_id: Some(session_id_owned),
+        context_window: None,
+        context_used_tokens: None,
+        context_left_pct: None,
+        events_path: latest_path.to_string_lossy().to_string(),
+        stderr_path: String::new(),
+        conclusion_path: String::new(),
+    })
+}
+
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<SessionMeta>>, StatusCode> {
+    let mut merged: HashMap<String, SessionMeta> = HashMap::new();
+
     let root = sessions_root(&state);
     tokio::fs::create_dir_all(&root)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mut sessions = Vec::new();
     let mut rd = tokio::fs::read_dir(&root)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -408,10 +749,98 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session
         }
         let mp = entry.path().join("meta.json");
         if let Some(meta) = read_meta(&mp).await {
-            sessions.push(meta);
+            merged.insert(meta.id.clone(), meta);
         }
     }
 
+    if let Some(codex_home) = state.codex_home.clone() {
+        ensure_native_cache(&state).await;
+        let rollouts = {
+            let locked = state.native_cache.lock().await;
+            locked.rollouts_by_session.clone()
+        };
+        let (history, titles) = tokio::task::spawn_blocking(move || {
+            (load_codex_history(&codex_home), load_codex_thread_titles(&codex_home))
+        })
+        .await
+        .unwrap_or_default();
+
+        for (session_id, paths) in rollouts {
+            if paths.is_empty() {
+                continue;
+            }
+            let earliest_path = paths
+                .first()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from(""));
+            let latest_path = paths
+                .last()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from(""));
+
+            let cwd = {
+                let cached = {
+                    let locked = state.native_cache.lock().await;
+                    locked.cwd_by_session.get(&session_id).cloned().flatten()
+                };
+                if cached.is_some() {
+                    cached
+                } else {
+                    let computed = extract_cwd_from_rollout(&latest_path).await;
+                    let mut locked = state.native_cache.lock().await;
+                    locked.cwd_by_session.insert(session_id.clone(), computed.clone());
+                    computed
+                }
+            };
+
+            let hist = history.get(&session_id);
+            let created_at_ms = match hist {
+                Some(h) => h.first_ts_ms,
+                None => file_mtime_ms(&earliest_path).await.unwrap_or_else(now_ms),
+            };
+            let last_used_at_ms = match hist {
+                Some(h) => h.last_ts_ms,
+                None => file_mtime_ms(&latest_path).await.unwrap_or_else(now_ms),
+            };
+
+            let title = titles
+                .get(&session_id)
+                .cloned()
+                .or_else(|| hist.map(|h| safe_title(&h.last_text)))
+                .unwrap_or_else(|| format!("Session {session_id}"));
+
+            let native = SessionMeta {
+                id: session_id.clone(),
+                title,
+                created_at_ms,
+                last_used_at_ms,
+                cwd,
+                status: SessionStatus::Done,
+                codex_session_id: Some(session_id.clone()),
+                context_window: None,
+                context_used_tokens: None,
+                context_left_pct: None,
+                events_path: latest_path.to_string_lossy().to_string(),
+                stderr_path: String::new(),
+                conclusion_path: String::new(),
+            };
+
+            merged
+                .entry(session_id.clone())
+                .and_modify(|s| {
+                    if s.cwd.is_none() {
+                        s.cwd = native.cwd.clone();
+                    }
+                    if native.created_at_ms < s.created_at_ms {
+                        s.created_at_ms = native.created_at_ms;
+                    }
+                    s.last_used_at_ms = s.last_used_at_ms.max(native.last_used_at_ms);
+                })
+                .or_insert(native);
+        }
+    }
+
+    let mut sessions: Vec<SessionMeta> = merged.into_values().collect();
     sessions.sort_by_key(|s| std::cmp::Reverse(s.last_used_at_ms.max(s.created_at_ms)));
     Ok(Json(sessions))
 }
@@ -582,16 +1011,6 @@ async fn continue_session(
         }
     }
 
-    let dir = session_dir(&state, &session_id);
-    let meta_path = dir.join("meta.json");
-    let Some(mut meta) = read_meta(&meta_path).await else {
-        return Err((StatusCode::NOT_FOUND, "meta.json not found").into_response());
-    };
-
-    let events_path = dir.join("events.jsonl");
-    let stderr_path = dir.join("stderr.log");
-    let conclusion_path = dir.join("conclusion.md");
-
     let cwd = req.cwd.and_then(|s| {
         let t = s.trim().to_string();
         if t.is_empty() {
@@ -600,6 +1019,49 @@ async fn continue_session(
             Some(t)
         }
     });
+
+    let dir = session_dir(&state, &session_id);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+    let meta_path = dir.join("meta.json");
+    let mut meta = if let Some(meta) = read_meta(&meta_path).await {
+        meta
+    } else {
+        let Some(native) = native_session_meta(&state, &session_id).await else {
+            return Err((StatusCode::NOT_FOUND, "session not found").into_response());
+        };
+        let now = now_ms();
+        let events_path = dir.join("events.jsonl");
+        let stderr_path = dir.join("stderr.log");
+        let conclusion_path = dir.join("conclusion.md");
+        let created_at_ms = native.created_at_ms;
+        let last_used_at_ms = now;
+
+        let meta = SessionMeta {
+            id: session_id.clone(),
+            title: native.title,
+            created_at_ms,
+            last_used_at_ms,
+            cwd: cwd.clone().or(native.cwd),
+            status: SessionStatus::Done,
+            codex_session_id: Some(session_id.clone()),
+            context_window: None,
+            context_used_tokens: None,
+            context_left_pct: None,
+            events_path: events_path.to_string_lossy().to_string(),
+            stderr_path: stderr_path.to_string_lossy().to_string(),
+            conclusion_path: conclusion_path.to_string_lossy().to_string(),
+        };
+        write_meta(&meta_path, &meta)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+        meta
+    };
+
+    let events_path = dir.join("events.jsonl");
+    let stderr_path = dir.join("stderr.log");
+    let conclusion_path = dir.join("conclusion.md");
 
     meta.status = SessionStatus::Running;
     meta.cwd = cwd.clone().or(meta.cwd);
@@ -755,9 +1217,28 @@ async fn delete_session(
 ) -> Result<StatusCode, Response> {
     let _ = stop_session(State(state.clone()), AxumPath(session_id.clone())).await;
     let dir = session_dir(&state, &session_id);
-    tokio::fs::remove_dir_all(dir)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+    let warp_exists = tokio::fs::metadata(&dir).await.ok().is_some_and(|m| m.is_dir());
+    if warp_exists {
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+    }
+
+    ensure_native_cache(&state).await;
+    let native_paths = {
+        let locked = state.native_cache.lock().await;
+        locked.rollouts_by_session.get(&session_id).cloned()
+    };
+    let has_native = native_paths.is_some();
+    if let Some(paths) = native_paths {
+        for p in paths {
+            let _ = tokio::fs::remove_file(p).await;
+        }
+    }
+
+    if !warp_exists && !has_native {
+        return Err((StatusCode::NOT_FOUND, "session not found").into_response());
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -770,13 +1251,68 @@ async fn rename_session(
         return Err((StatusCode::BAD_REQUEST, "title required").into_response());
     };
     let mp = meta_path(&state, &session_id);
-    let Some(mut meta) = read_meta(&mp).await else {
-        return Err((StatusCode::NOT_FOUND, "meta.json not found").into_response());
+    if let Some(mut meta) = read_meta(&mp).await {
+        meta.title = title.clone();
+        write_meta(&mp, &meta)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    ensure_native_cache(&state).await;
+    let has_native = {
+        let locked = state.native_cache.lock().await;
+        locked.rollouts_by_session.contains_key(&session_id)
     };
-    meta.title = title.clone();
-    write_meta(&mp, &meta)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+    if !has_native {
+        return Err((StatusCode::NOT_FOUND, "session not found").into_response());
+    }
+
+    let Some(codex_home) = state.codex_home.clone() else {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "codex_home not configured").into_response());
+    };
+    let session_id_for_write = session_id.clone();
+    let title_for_write = title.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let path = codex_home.join(".codex-global-state.json");
+        let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({})),
+            Err(_) => serde_json::json!({}),
+        };
+        if !root.is_object() {
+            root = serde_json::json!({});
+        }
+        if !root.get("thread-titles").is_some_and(|v| v.is_object()) {
+            root["thread-titles"] = serde_json::json!({});
+        }
+        if !root["thread-titles"]
+            .get("titles")
+            .is_some_and(|v| v.is_object())
+        {
+            root["thread-titles"]["titles"] = serde_json::json!({});
+        }
+        root["thread-titles"]["titles"][&session_id_for_write] =
+            serde_json::Value::String(title_for_write.clone());
+
+        if !root["thread-titles"]
+            .get("order")
+            .is_some_and(|v| v.is_array())
+        {
+            root["thread-titles"]["order"] = serde_json::json!([]);
+        }
+        if let Some(arr) = root["thread-titles"]["order"].as_array_mut() {
+            let exists = arr.iter().any(|v| v.as_str() == Some(&session_id_for_write));
+            if !exists {
+                arr.insert(0, serde_json::Value::String(session_id_for_write.clone()));
+            }
+        }
+
+        std::fs::write(&path, serde_json::to_vec_pretty(&root)?)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -786,9 +1322,20 @@ async fn read_conclusion(
 ) -> Result<String, Response> {
     let dir = session_dir(&state, &session_id);
     let path = dir.join("conclusion.md");
-    tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
+    if let Ok(text) = tokio::fs::read_to_string(&path).await {
+        return Ok(text);
+    }
+
+    ensure_native_cache(&state).await;
+    let has_native = {
+        let locked = state.native_cache.lock().await;
+        locked.rollouts_by_session.contains_key(&session_id)
+    };
+    if has_native {
+        return Ok(String::new());
+    }
+
+    Err((StatusCode::NOT_FOUND, "session not found").into_response())
 }
 
 #[derive(Deserialize)]
@@ -891,13 +1438,18 @@ async fn touch_session(
     AxumPath(session_id): AxumPath<String>,
 ) -> Result<Json<SessionMeta>, Response> {
     let mp = meta_path(&state, &session_id);
-    let Some(mut meta) = read_meta(&mp).await else {
-        return Err((StatusCode::NOT_FOUND, "meta.json not found").into_response());
+    if let Some(mut meta) = read_meta(&mp).await {
+        meta.last_used_at_ms = now_ms();
+        write_meta(&mp, &meta)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+        return Ok(Json(meta));
+    }
+
+    let Some(mut meta) = native_session_meta(&state, &session_id).await else {
+        return Err((StatusCode::NOT_FOUND, "session not found").into_response());
     };
     meta.last_used_at_ms = now_ms();
-    write_meta(&mp, &meta)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
     Ok(Json(meta))
 }
 
@@ -905,6 +1457,58 @@ async fn touch_session(
 struct StreamQuery {
     #[serde(default)]
     tail: Option<usize>,
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    // https://howardhinnant.github.io/date_algorithms.html#days_from_civil
+    let y = y - if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = m + if m > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn parse_rfc3339_ms(ts: &str) -> Option<u64> {
+    // Handles examples like: "2026-01-31T09:11:23.415Z"
+    let s = ts.trim();
+    if !s.ends_with('Z') {
+        return None;
+    }
+    let s = &s[..s.len() - 1];
+    let (date, time) = s.split_once('T')?;
+    let mut date_it = date.split('-');
+    let y: i64 = date_it.next()?.parse().ok()?;
+    let m: i64 = date_it.next()?.parse().ok()?;
+    let d: i64 = date_it.next()?.parse().ok()?;
+
+    let mut time_it = time.split(':');
+    let hh: i64 = time_it.next()?.parse().ok()?;
+    let mm: i64 = time_it.next()?.parse().ok()?;
+    let sec_part = time_it.next()?;
+    let (ss_str, frac_str) = sec_part.split_once('.').unwrap_or((sec_part, ""));
+    let ss: i64 = ss_str.parse().ok()?;
+    let mut ms: i64 = 0;
+    if !frac_str.is_empty() {
+        let mut digits = frac_str.chars().take(3).collect::<String>();
+        while digits.len() < 3 {
+            digits.push('0');
+        }
+        ms = digits.parse::<i64>().ok()?;
+    }
+
+    let days = days_from_civil(y, m, d);
+    let total_ms = days
+        .checked_mul(86_400_000)?
+        .checked_add(hh.checked_mul(3_600_000)?)?
+        .checked_add(mm.checked_mul(60_000)?)?
+        .checked_add(ss.checked_mul(1_000)?)?
+        .checked_add(ms)?;
+    if total_ms < 0 {
+        return None;
+    }
+    Some(total_ms as u64)
 }
 
 async fn stream_session(
@@ -915,12 +1519,13 @@ async fn stream_session(
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, Response>
 {
     let dir = session_dir(&state, &session_id);
-    if tokio::fs::metadata(&dir)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "session not found").into_response())?
-        .is_dir()
-        == false
-    {
+    let warp_exists = tokio::fs::metadata(&dir).await.ok().is_some_and(|m| m.is_dir());
+    let native_paths = {
+        ensure_native_cache(&state).await;
+        let locked = state.native_cache.lock().await;
+        locked.rollouts_by_session.get(&session_id).cloned()
+    };
+    if !warp_exists && native_paths.is_none() {
         return Err((StatusCode::NOT_FOUND, "session not found").into_response());
     }
 
@@ -932,41 +1537,89 @@ async fn stream_session(
     let events_path = dir.join("events.jsonl");
     let stderr_path = dir.join("stderr.log");
 
-    let mut backlog: Vec<UiEvent> = Vec::new();
+    let mut backlog: Vec<(u64, usize, UiEvent)> = Vec::new();
+    let mut seq: usize = 0;
 
-    // Replay stdout events
-    for (idx, raw) in read_tail_lines(&events_path, tail).await.into_iter().enumerate() {
-        let mut json: Option<serde_json::Value> = None;
-        let mut ts_ms = now_ms();
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(t) = v.get("_ts_ms").and_then(|x| x.as_u64()) {
-                ts_ms = t;
+    if tail > 0 {
+        if let Some(paths) = native_paths.clone() {
+            for path in paths {
+                for raw in read_tail_lines(&path, tail).await {
+                    let mut json: Option<serde_json::Value> = None;
+                    let mut ts_ms = now_ms();
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        if let Some(t) = v
+                            .get("timestamp")
+                            .and_then(|x| x.as_str())
+                            .and_then(parse_rfc3339_ms)
+                        {
+                            ts_ms = t;
+                        }
+                        json = Some(v);
+                    }
+                    backlog.push((
+                        ts_ms,
+                        seq,
+                        UiEvent {
+                            session_id: session_id.clone(),
+                            ts_ms,
+                            stream: "stdout".to_string(),
+                            raw,
+                            json,
+                        },
+                    ));
+                    seq = seq.saturating_add(1);
+                }
             }
-            json = Some(v);
         }
-        backlog.push(UiEvent {
-            session_id: session_id.clone(),
-            ts_ms,
-            stream: "stdout".to_string(),
-            raw,
-            json,
-        });
-        // ensure stable tie-break ordering
-        let _ = idx;
+
+        if warp_exists {
+            // Replay stdout events
+            for raw in read_tail_lines(&events_path, tail).await {
+                let mut json: Option<serde_json::Value> = None;
+                let mut ts_ms = now_ms();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(t) = v.get("_ts_ms").and_then(|x| x.as_u64()) {
+                        ts_ms = t;
+                    }
+                    json = Some(v);
+                }
+                backlog.push((
+                    ts_ms,
+                    seq,
+                    UiEvent {
+                        session_id: session_id.clone(),
+                        ts_ms,
+                        stream: "stdout".to_string(),
+                        raw,
+                        json,
+                    },
+                ));
+                seq = seq.saturating_add(1);
+            }
+
+            // Replay stderr as raw lines (timestamps may be embedded in text).
+            for raw in read_tail_lines(&stderr_path, tail).await {
+                backlog.push((
+                    now_ms(),
+                    seq,
+                    UiEvent {
+                        session_id: session_id.clone(),
+                        ts_ms: now_ms(),
+                        stream: "stderr".to_string(),
+                        raw,
+                        json: None,
+                    },
+                ));
+                seq = seq.saturating_add(1);
+            }
+        }
     }
 
-    // Replay stderr as raw lines (timestamps may be embedded in text).
-    for raw in read_tail_lines(&stderr_path, tail).await {
-        backlog.push(UiEvent {
-            session_id: session_id.clone(),
-            ts_ms: now_ms(),
-            stream: "stderr".to_string(),
-            raw,
-            json: None,
-        });
+    backlog.sort_by_key(|(ts, seq, _)| (*ts, *seq));
+    let mut backlog: Vec<UiEvent> = backlog.into_iter().map(|(_, _, e)| e).collect();
+    if tail > 0 && backlog.len() > tail {
+        backlog = backlog.split_off(backlog.len() - tail);
     }
-
-    backlog.sort_by_key(|e| e.ts_ms);
 
     let tx = ensure_stream(&state, &session_id).await;
     let rx = tx.subscribe();
@@ -1868,11 +2521,29 @@ async fn main() -> anyhow::Result<()> {
             if t.is_empty() { None } else { Some(PathBuf::from(t)) }
         });
 
+    let codex_home = match args.codex_home {
+        Some(raw) => {
+            let t = raw.trim().to_string();
+            if t.is_empty() {
+                default_codex_home()
+            } else {
+                Some(PathBuf::from(t))
+            }
+        }
+        None => default_codex_home(),
+    };
+
     let state = AppState {
         data_dir,
         codex_path,
+        codex_home,
         runs: Arc::new(Mutex::new(HashMap::new())),
         streams: Arc::new(Mutex::new(HashMap::new())),
+        native_cache: Arc::new(Mutex::new(NativeCache {
+            built_at_ms: 0,
+            rollouts_by_session: HashMap::new(),
+            cwd_by_session: HashMap::new(),
+        })),
     };
 
     let mut app = Router::new()
