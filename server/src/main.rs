@@ -159,7 +159,17 @@ struct AppState {
 struct NativeCache {
     built_at_ms: u64,
     rollouts_by_session: HashMap<String, Vec<PathBuf>>,
-    cwd_by_session: HashMap<String, Option<String>>,
+    derived_by_session: HashMap<String, NativeDerived>,
+}
+
+#[derive(Clone)]
+struct NativeDerived {
+    latest_path: PathBuf,
+    latest_mtime_ms: u64,
+    cwd: Option<String>,
+    originator: Option<String>,
+    source: Option<String>,
+    last_prompt: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -400,6 +410,38 @@ fn resolve_codex_executable(state: &AppState) -> anyhow::Result<PathBuf> {
     anyhow::bail!("codex executable not found on PATH (set --codex-path)")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn extract_session_meta_triplet_falls_back_when_base_instructions_precedes_originator() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("codex-warp-rollout-{}.jsonl", Uuid::new_v4()));
+
+        let line = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "cwd": "/tmp",
+                "base_instructions": { "text": "x" },
+                "originator": "codex_exec",
+                "source": "exec"
+            }
+        })
+        .to_string();
+
+        tokio::fs::write(&path, format!("{line}\n")).await.unwrap();
+
+        let (cwd, originator, source) = extract_session_meta_triplet_from_rollout(&path).await;
+        assert_eq!(cwd.as_deref(), Some("/tmp"));
+        assert_eq!(originator.as_deref(), Some("codex_exec"));
+        assert_eq!(source.as_deref(), Some("exec"));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+}
+
 async fn read_tail_lines(path: &Path, max_lines: usize) -> Vec<String> {
     if max_lines == 0 {
         return Vec::new();
@@ -525,8 +567,10 @@ async fn ensure_native_cache(state: &AppState) {
     {
         let mut locked = state.native_cache.lock().await;
         locked.built_at_ms = now_ms();
+        locked
+            .derived_by_session
+            .retain(|k, _| scanned.contains_key(k));
         locked.rollouts_by_session = scanned;
-        locked.cwd_by_session.clear();
     }
 }
 
@@ -582,9 +626,68 @@ fn extract_json_string_field(prefix: &str, key: &str) -> Option<String> {
 }
 
 async fn extract_cwd_from_rollout(path: &Path) -> Option<String> {
-    let prefix = read_prefix(path, 8_192).await.ok()?;
+    extract_session_meta_field_from_rollout(path, "cwd").await
+}
+
+async fn extract_session_meta_field_from_rollout(path: &Path, key: &str) -> Option<String> {
+    let prefix = read_prefix(path, 16_384).await.ok()?;
     let text = String::from_utf8_lossy(&prefix);
-    extract_json_string_field(&text, "cwd")
+    let clipped = match text.find("\"base_instructions\"") {
+        Some(idx) => &text[..idx],
+        None => &text,
+    };
+    extract_json_string_field(clipped, key)
+}
+
+async fn extract_session_meta_triplet_from_rollout(
+    path: &Path,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let cwd = extract_session_meta_field_from_rollout(path, "cwd").await;
+    let originator = extract_session_meta_field_from_rollout(path, "originator").await;
+    let source = extract_session_meta_field_from_rollout(path, "source").await;
+
+    // Fast path: most rollouts have originator at the beginning of the meta line.
+    if originator.is_some() {
+        return (cwd, originator, source);
+    }
+
+    // Slow path: handle cases where the session_meta line puts huge fields (like base_instructions)
+    // before originator/source, making prefix-scanning unreliable.
+    #[derive(Deserialize)]
+    struct RolloutMetaLine {
+        #[serde(rename = "type")]
+        ty: Option<String>,
+        payload: Option<RolloutMetaPayload>,
+    }
+    #[derive(Deserialize)]
+    struct RolloutMetaPayload {
+        cwd: Option<String>,
+        originator: Option<String>,
+        source: Option<String>,
+    }
+
+    let path_for_parse = path.to_path_buf();
+    let parsed = tokio::task::spawn_blocking(
+        move || -> Option<(Option<String>, Option<String>, Option<String>)> {
+            let file = std::fs::File::open(path_for_parse).ok()?;
+            let mut de = serde_json::Deserializer::from_reader(file);
+            let meta = RolloutMetaLine::deserialize(&mut de).ok()?;
+            if meta.ty.as_deref() != Some("session_meta") {
+                return None;
+            }
+            let payload = meta.payload?;
+            Some((payload.cwd, payload.originator, payload.source))
+        },
+    )
+    .await
+    .ok()
+    .flatten();
+
+    if let Some((cwd2, originator2, source2)) = parsed {
+        return (cwd.or(cwd2), originator.or(originator2), source.or(source2));
+    }
+
+    (cwd, originator, source)
 }
 
 async fn file_mtime_ms(path: &Path) -> Option<u64> {
@@ -659,16 +762,163 @@ fn load_codex_thread_titles(codex_home: &Path) -> HashMap<String, String> {
     out
 }
 
+fn should_show_rollout_user_text(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.starts_with("# AGENTS.md") {
+        return false;
+    }
+    if t.starts_with("<environment_context") {
+        return false;
+    }
+    if t.contains("<INSTRUCTIONS>") {
+        return false;
+    }
+    true
+}
+
+fn extract_rollout_content_text(content: &serde_json::Value) -> String {
+    let Some(arr) = content.as_array() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for item in arr {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        if ty != "input_text" && ty != "output_text" {
+            continue;
+        }
+        let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        out.push_str(text);
+    }
+    out
+}
+
+async fn read_tail_bytes(path: &Path, max_bytes: u64) -> Vec<String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let len = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(_) => return Vec::new(),
+    };
+    let start = len.saturating_sub(max_bytes);
+    if start > 0 {
+        let _ = file.seek(std::io::SeekFrom::Start(start)).await;
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).await.is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut iter = text.lines();
+    if start > 0 {
+        // Drop potential partial line due to seeking into the middle.
+        let _ = iter.next();
+    }
+    iter.map(|l| l.to_string()).collect()
+}
+
+async fn find_last_prompt_from_rollout(path: &Path) -> Option<String> {
+    const MAX_BYTES: u64 = 96 * 1024;
+    let lines = read_tail_bytes(path, MAX_BYTES).await;
+    for raw in lines.into_iter().rev() {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(t).ok()?;
+        let Some(kind) = v.get("type").and_then(|x| x.as_str()) else {
+            continue;
+        };
+
+        if kind == "event_msg" {
+            let Some(payload) = v.get("payload").and_then(|x| x.as_object()) else {
+                continue;
+            };
+            if payload.get("type").and_then(|x| x.as_str()) != Some("user_message") {
+                continue;
+            }
+            let Some(message) = payload.get("message").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            if should_show_rollout_user_text(message) {
+                return Some(message.trim().to_string());
+            }
+            continue;
+        }
+
+        if kind == "response_item" {
+            let Some(payload) = v.get("payload").and_then(|x| x.as_object()) else {
+                continue;
+            };
+            if payload.get("type").and_then(|x| x.as_str()) != Some("message") {
+                continue;
+            }
+            if payload.get("role").and_then(|x| x.as_str()) != Some("user") {
+                continue;
+            }
+            let content = payload.get("content")?;
+            let text = extract_rollout_content_text(content);
+            if should_show_rollout_user_text(&text) {
+                return Some(text.trim().to_string());
+            }
+            continue;
+        }
+    }
+    None
+}
+
+async fn get_or_compute_native_derived(
+    state: &AppState,
+    session_id: &str,
+    latest_path: &Path,
+) -> NativeDerived {
+    let latest_mtime_ms = file_mtime_ms(latest_path).await.unwrap_or(0);
+    {
+        let locked = state.native_cache.lock().await;
+        if let Some(cached) = locked.derived_by_session.get(session_id) {
+            if cached.latest_path == latest_path && cached.latest_mtime_ms == latest_mtime_ms {
+                return cached.clone();
+            }
+        }
+    }
+
+    let (cwd, originator, source) = extract_session_meta_triplet_from_rollout(latest_path).await;
+    let last_prompt = find_last_prompt_from_rollout(latest_path).await;
+
+    let derived = NativeDerived {
+        latest_path: latest_path.to_path_buf(),
+        latest_mtime_ms,
+        cwd,
+        originator,
+        source,
+        last_prompt,
+    };
+
+    let mut locked = state.native_cache.lock().await;
+    locked
+        .derived_by_session
+        .insert(session_id.to_string(), derived.clone());
+    derived
+}
+
 async fn native_session_meta(state: &AppState, session_id: &str) -> Option<SessionMeta> {
     let codex_home = state.codex_home.clone()?;
     ensure_native_cache(state).await;
 
-    let (paths, cached_cwd) = {
+    let paths = {
         let locked = state.native_cache.lock().await;
-        (
-            locked.rollouts_by_session.get(session_id).cloned(),
-            locked.cwd_by_session.get(session_id).cloned().flatten(),
-        )
+        locked.rollouts_by_session.get(session_id).cloned()
     };
     let paths = paths?;
     if paths.is_empty() {
@@ -677,42 +927,27 @@ async fn native_session_meta(state: &AppState, session_id: &str) -> Option<Sessi
     let earliest_path = paths.first().cloned().unwrap_or_else(|| PathBuf::from(""));
     let latest_path = paths.last().cloned().unwrap_or_else(|| PathBuf::from(""));
 
-    let cwd = if cached_cwd.is_some() {
-        cached_cwd
-    } else {
-        let computed = extract_cwd_from_rollout(&latest_path).await;
-        let mut locked = state.native_cache.lock().await;
-        locked
-            .cwd_by_session
-            .insert(session_id.to_string(), computed.clone());
-        computed
-    };
+    let derived = get_or_compute_native_derived(state, session_id, &latest_path).await;
+    if derived.source.as_deref() == Some("exec") || derived.originator.as_deref() == Some("codex_exec") {
+        return None;
+    }
+    let cwd = derived.cwd.clone();
 
     let session_id_owned = session_id.to_string();
-    let (history, titles) = tokio::task::spawn_blocking(move || {
-        (
-            load_codex_history(&codex_home),
-            load_codex_thread_titles(&codex_home),
-        )
-    })
+    let titles = tokio::task::spawn_blocking(move || load_codex_thread_titles(&codex_home))
     .await
     .unwrap_or_default();
 
-    let hist = history.get(&session_id_owned);
-    let created_at_ms = match hist {
-        Some(h) => h.first_ts_ms,
-        None => file_mtime_ms(&earliest_path).await.unwrap_or_else(now_ms),
-    };
-    let last_used_at_ms = match hist {
-        Some(h) => h.last_ts_ms,
-        None => file_mtime_ms(&latest_path).await.unwrap_or_else(now_ms),
-    };
+    let created_at_ms = file_mtime_ms(&earliest_path).await.unwrap_or_else(now_ms);
+    let last_used_at_ms = file_mtime_ms(&latest_path).await.unwrap_or_else(now_ms);
 
-    let title = titles
-        .get(&session_id_owned)
-        .cloned()
-        .or_else(|| hist.map(|h| safe_title(&h.last_text)))
-        .unwrap_or_else(|| format!("Session {session_id}"));
+    let title = titles.get(&session_id_owned).cloned().or_else(|| {
+        derived
+            .last_prompt
+            .as_deref()
+            .filter(|t| should_show_rollout_user_text(t))
+            .map(safe_title)
+    })?;
 
     Some(SessionMeta {
         id: session_id_owned.clone(),
@@ -759,9 +994,7 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session
             let locked = state.native_cache.lock().await;
             locked.rollouts_by_session.clone()
         };
-        let (history, titles) = tokio::task::spawn_blocking(move || {
-            (load_codex_history(&codex_home), load_codex_thread_titles(&codex_home))
-        })
+        let titles = tokio::task::spawn_blocking(move || load_codex_thread_titles(&codex_home))
         .await
         .unwrap_or_default();
 
@@ -778,36 +1011,32 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session
                 .cloned()
                 .unwrap_or_else(|| PathBuf::from(""));
 
-            let cwd = {
-                let cached = {
-                    let locked = state.native_cache.lock().await;
-                    locked.cwd_by_session.get(&session_id).cloned().flatten()
-                };
-                if cached.is_some() {
-                    cached
-                } else {
-                    let computed = extract_cwd_from_rollout(&latest_path).await;
-                    let mut locked = state.native_cache.lock().await;
-                    locked.cwd_by_session.insert(session_id.clone(), computed.clone());
-                    computed
-                }
+            let derived = get_or_compute_native_derived(&state, &session_id, &latest_path).await;
+            if derived.source.as_deref() == Some("exec")
+                || derived.originator.as_deref() == Some("codex_exec")
+            {
+                continue;
+            }
+            let cwd = derived.cwd.clone();
+
+            let created_at_ms = file_mtime_ms(&earliest_path).await.unwrap_or_else(now_ms);
+            let last_used_at_ms = if derived.latest_mtime_ms > 0 {
+                derived.latest_mtime_ms
+            } else {
+                file_mtime_ms(&latest_path).await.unwrap_or_else(now_ms)
             };
 
-            let hist = history.get(&session_id);
-            let created_at_ms = match hist {
-                Some(h) => h.first_ts_ms,
-                None => file_mtime_ms(&earliest_path).await.unwrap_or_else(now_ms),
+            let title = titles.get(&session_id).cloned().or_else(|| {
+                derived
+                    .last_prompt
+                    .as_deref()
+                    .filter(|t| should_show_rollout_user_text(t))
+                    .map(safe_title)
+            });
+            let Some(title) = title else {
+                // Hide sessions with no meaningful user prompt to keep the list close to the official app.
+                continue;
             };
-            let last_used_at_ms = match hist {
-                Some(h) => h.last_ts_ms,
-                None => file_mtime_ms(&latest_path).await.unwrap_or_else(now_ms),
-            };
-
-            let title = titles
-                .get(&session_id)
-                .cloned()
-                .or_else(|| hist.map(|h| safe_title(&h.last_text)))
-                .unwrap_or_else(|| format!("Session {session_id}"));
 
             let native = SessionMeta {
                 id: session_id.clone(),
@@ -2542,7 +2771,7 @@ async fn main() -> anyhow::Result<()> {
         native_cache: Arc::new(Mutex::new(NativeCache {
             built_at_ms: 0,
             rollouts_by_session: HashMap::new(),
-            cwd_by_session: HashMap::new(),
+            derived_by_session: HashMap::new(),
         })),
     };
 
