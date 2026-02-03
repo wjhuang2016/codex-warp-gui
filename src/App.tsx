@@ -981,6 +981,7 @@ function App() {
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const threadListRef = useRef<HTMLDivElement | null>(null);
+  const threadMoreRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const composingPromptRef = useRef(false);
   const scrollStateBySessionRef = useRef<
@@ -1252,6 +1253,32 @@ function App() {
       if (next <= cur) return prev;
       return { ...prev, [activeProjectKey]: next };
     });
+  }, [activeProjectKey, hasMoreThreads, sessionsForActiveProject.length]);
+
+  useEffect(() => {
+    const root = threadListRef.current;
+    const target = threadMoreRef.current;
+    if (!root || !target) return;
+    if (!hasMoreThreads) return;
+
+    const obs = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((e) => e.isIntersecting)) return;
+        setThreadsLimitByProject((prev) => {
+          const cur = prev[activeProjectKey] ?? THREADS_PAGE_SIZE;
+          const next = Math.min(cur + THREADS_PAGE_SIZE, sessionsForActiveProject.length);
+          if (next <= cur) return prev;
+          return { ...prev, [activeProjectKey]: next };
+        });
+      },
+      {
+        root,
+        rootMargin: `0px 0px ${THREADS_SCROLL_THRESHOLD_PX}px 0px`,
+        threshold: 0.01,
+      },
+    );
+    obs.observe(target);
+    return () => obs.disconnect();
   }, [activeProjectKey, hasMoreThreads, sessionsForActiveProject.length]);
 
   const markdownComponents: Components = useMemo(
@@ -2504,6 +2531,17 @@ function App() {
           Threads <span className="muted mono">{activeProjectLabel}</span>
         </div>
         <div className="sessionList" ref={threadListRef} onScroll={onThreadListScroll}>
+          {visibleSessionsForActiveProject.length === 0 ? (
+            <div className="sessionEmpty">
+              <div className="sessionEmptyTitle">No threads yet.</div>
+              <div className="muted">
+                {IS_TAURI && !isRemote
+                  ? "Click Run to create one."
+                  : "Check Settings → Remote base URL, or create a new session on this server."}
+              </div>
+            </div>
+          ) : null}
+
           {visibleSessionsForActiveProject.map((s) => (
             <button
               key={s.id}
@@ -2524,8 +2562,9 @@ function App() {
               </div>
             </button>
           ))}
+          <div ref={threadMoreRef} className="sessionSentinel" />
           {hasMoreThreads ? (
-            <div className="sessionListFooter muted mono">Scroll to load more…</div>
+            <div className="sessionListFooter muted mono">Loading more…</div>
           ) : null}
         </div>
       </aside>
