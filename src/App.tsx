@@ -273,6 +273,27 @@ function clampTitle(text: string, max = 70): string {
   return `${s.slice(0, max)}…`;
 }
 
+function normalizeCwdPath(raw: string): string {
+  const t = (raw || "").trim();
+  if (!t) return "";
+  // Normalize trailing slashes for stable grouping.
+  return t.replace(/[\\/]+$/, "");
+}
+
+function basenameFromPath(raw: string): string {
+  const t = normalizeCwdPath(raw);
+  if (!t) return "";
+  const parts = t.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? t;
+}
+
+function projectFromCwd(cwd: string | null | undefined): { key: string; label: string; path: string | null } {
+  const norm = normalizeCwdPath(cwd ?? "");
+  if (!norm) return { key: "__no_project__", label: "No project", path: null };
+  const label = basenameFromPath(norm) || norm;
+  return { key: norm, label, path: norm };
+}
+
 function sortSessionsByRecency(items: SessionMeta[]): SessionMeta[] {
   return items
     .slice()
@@ -353,6 +374,20 @@ type TodoItem = {
   done: boolean;
 };
 
+type ActivityItem = {
+  id: string;
+  ts_ms: number;
+  text: string;
+};
+
+type ProjectGroup = {
+  key: string;
+  label: string;
+  path: string | null;
+  sessions: SessionMeta[];
+  lastUsedAt: number;
+};
+
 type SkillPickerState = {
   start: number;
   end: number;
@@ -380,6 +415,29 @@ function previewText(text: string): string {
   const max = 140;
   if (first.length <= max) return first;
   return `${first.slice(0, max)}…`;
+}
+
+function runActivityTextFromJson(json: unknown): string | null {
+  if (!isObject(json)) return null;
+  const method = typeof (json as any).method === "string" ? String((json as any).method) : "";
+  if (!method.startsWith("codex/event/")) return null;
+
+  const params = isObject((json as any).params) ? ((json as any).params as any) : {};
+  const messageFields = ["message", "summary", "text", "title", "label", "name"];
+  for (const k of messageFields) {
+    const v = params && typeof params[k] === "string" ? String(params[k]).trim() : "";
+    if (v) return stripToolCitations(v);
+  }
+
+  const short = method.slice("codex/event/".length).replace(/\//g, " ");
+  const parts: string[] = [short || "event"];
+  const query = params && typeof params.query === "string" ? params.query.trim() : "";
+  const path = params && typeof params.path === "string" ? params.path.trim() : "";
+  const tool = params && typeof params.tool === "string" ? params.tool.trim() : "";
+  if (query) parts.push(query);
+  if (path) parts.push(path);
+  if (tool) parts.push(tool);
+  return stripToolCitations(parts.filter(Boolean).join(" • "));
 }
 
 function computeSkillTrigger(text: string, cursor: number): Omit<SkillPickerState, "selected"> | null {
@@ -881,7 +939,7 @@ function App() {
   const [mobilePanel, setMobilePanel] = useState<null | "sessions" | "right">(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showSessionSettings, setShowSessionSettings] = useState(false);
-  const [showCwdShell, setShowCwdShell] = useState(false);
+  const [showTerminalDrawer, setShowTerminalDrawer] = useState(false);
   const [settings, setSettings] = useState<Settings>({});
   const [codexPathDraft, setCodexPathDraft] = useState("");
   const [defaultCwdDraft, setDefaultCwdDraft] = useState("");
@@ -893,11 +951,15 @@ function App() {
   const [startingSessionId, setStartingSessionId] = useState<string | null>(null);
   const [blocksBySession, setBlocksBySession] = useState<Record<string, Block[]>>({});
   const [conclusionBySession, setConclusionBySession] = useState<Record<string, string>>({});
+  const [activityBySession, setActivityBySession] = useState<Record<string, ActivityItem[]>>({});
   const [metricsBySession, setMetricsBySession] = useState<Record<string, ContextMetrics>>({});
   const [usageRecords, setUsageRecords] = useState<UsageRecord[]>([]);
   const [usageLoading, setUsageLoading] = useState(false);
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(false);
+  const [activeProjectKey, setActiveProjectKey] = useState(() => {
+    return localStorage.getItem("codex_warp_active_project") ?? "all";
+  });
   const [skillPicker, setSkillPicker] = useState<SkillPickerState | null>(null);
   const [prompt, setPrompt] = useState("");
   const [cwd, setCwd] = useState("");
@@ -923,6 +985,7 @@ function App() {
   const activeSessionStatusRef = useRef<SessionStatus | null>(null);
   const showSettingsRef = useRef(false);
   const showSessionSettingsRef = useRef(false);
+  const showTerminalDrawerRef = useRef(false);
   const showRenameRef = useRef(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const eventSourceSessionIdRef = useRef<string | null>(null);
@@ -1000,6 +1063,16 @@ function App() {
   useEffect(() => {
     localStorage.setItem("codex_warp_remote_base_url", remoteBaseUrl);
   }, [remoteBaseUrl]);
+
+  useEffect(() => {
+    localStorage.setItem("codex_warp_active_project", activeProjectKey);
+  }, [activeProjectKey]);
+
+  useEffect(() => {
+    if (!IS_TAURI || isRemote) {
+      setShowTerminalDrawer(false);
+    }
+  }, [isRemote]);
 
   const stopRun = useCallback(
     async (sessionId: string) => {
@@ -1102,6 +1175,49 @@ function App() {
     [activeSessionId, sessions],
   );
 
+  const projectGroups = useMemo<ProjectGroup[]>(() => {
+    const map = new Map<string, ProjectGroup>();
+    for (const s of sessions) {
+      const { key, label, path } = projectFromCwd(s.cwd);
+      const lastUsedAt = s.last_used_at_ms || s.created_at_ms || 0;
+      const existing =
+        map.get(key) ??
+        {
+          key,
+          label,
+          path,
+          sessions: [],
+          lastUsedAt,
+        };
+      existing.sessions.push(s);
+      existing.lastUsedAt = Math.max(existing.lastUsedAt, lastUsedAt);
+      map.set(key, existing);
+    }
+    const groups = [...map.values()];
+    for (const g of groups) {
+      g.sessions = sortSessionsByRecency(g.sessions);
+    }
+    groups.sort((a, b) => b.lastUsedAt - a.lastUsedAt || a.label.localeCompare(b.label));
+    return groups;
+  }, [sessions]);
+
+  useEffect(() => {
+    if (activeProjectKey === "all") return;
+    if (projectGroups.some((g) => g.key === activeProjectKey)) return;
+    setActiveProjectKey("all");
+  }, [activeProjectKey, projectGroups]);
+
+  const activeProjectLabel = useMemo(() => {
+    if (activeProjectKey === "all") return "All projects";
+    const g = projectGroups.find((x) => x.key === activeProjectKey);
+    return g ? g.label : "All projects";
+  }, [activeProjectKey, projectGroups]);
+
+  const sessionsForActiveProject = useMemo(() => {
+    if (activeProjectKey === "all") return sessions;
+    return sessions.filter((s) => projectFromCwd(s.cwd).key === activeProjectKey);
+  }, [activeProjectKey, sessions]);
+
   const markdownComponents: Components = useMemo(
     () => ({
       a({ node: _node, href, children, ...props }) {
@@ -1142,8 +1258,16 @@ function App() {
     activeSessionStatusRef.current = activeSession?.status ?? null;
     showSettingsRef.current = showSettings;
     showSessionSettingsRef.current = showSessionSettings;
+    showTerminalDrawerRef.current = showTerminalDrawer;
     showRenameRef.current = showRename;
-  }, [activeSession?.status, activeSessionId, showRename, showSettings, showSessionSettings]);
+  }, [
+    activeSession?.status,
+    activeSessionId,
+    showRename,
+    showSettings,
+    showSessionSettings,
+    showTerminalDrawer,
+  ]);
 
   useEffect(() => {
     if (!IS_TAURI || isRemote) return;
@@ -1181,10 +1305,6 @@ function App() {
 
   function closeSessionSettings() {
     setShowSessionSettings(false);
-    setShowCwdShell(false);
-    if (IS_TAURI && !isRemote) {
-      void invoke("stop_shell").catch(() => {});
-    }
   }
 
   const onPromptPaste = useCallback(
@@ -1241,6 +1361,11 @@ function App() {
       if (showRenameRef.current) {
         e.preventDefault();
         setShowRename(false);
+        return;
+      }
+      if (showTerminalDrawerRef.current && activeSessionStatusRef.current !== "running") {
+        e.preventDefault();
+        setShowTerminalDrawer(false);
         return;
       }
       if (activeSessionStatusRef.current !== "running") return;
@@ -1366,6 +1491,12 @@ function App() {
     if (activeSession?.title) return clampTitle(activeSession.title, 84);
     return "";
   }, [activeSession?.title, activeSessionId, lastPromptBySession]);
+
+  const runActivity = useMemo(
+    () => activityBySession[activeSessionId] ?? [],
+    [activityBySession, activeSessionId],
+  );
+  const recentRunActivity = useMemo(() => runActivity.slice(-4), [runActivity]);
 
   const filteredBlocks = useMemo(() => {
     const kind = blockKindFilter;
@@ -1639,6 +1770,17 @@ function App() {
           }
         }
 
+        const activityText = runActivityTextFromJson(payload.json);
+        if (activityText) {
+          setActivityBySession((prev) => {
+            const list = prev[payload.session_id] ?? [];
+            const next = [...list, { id: newId(), ts_ms: payload.ts_ms, text: activityText }].slice(
+              -120,
+            );
+            return { ...prev, [payload.session_id]: next };
+          });
+        }
+
         setBlocksBySession((prev) => ({
           ...prev,
           [payload.session_id]: applyUiEventToBlocks(prev[payload.session_id] ?? [], payload),
@@ -1740,6 +1882,14 @@ function App() {
 
     void listen<UiEvent>("codex_event", ({ payload }) => {
       if (!payload?.session_id) return;
+      const activityText = runActivityTextFromJson(payload.json);
+      if (activityText) {
+        setActivityBySession((prev) => {
+          const list = prev[payload.session_id] ?? [];
+          const next = [...list, { id: newId(), ts_ms: payload.ts_ms, text: activityText }].slice(-120);
+          return { ...prev, [payload.session_id]: next };
+        });
+      }
       setBlocksBySession((prev) => ({
         ...prev,
         [payload.session_id]: applyUiEventToBlocks(prev[payload.session_id] ?? [], payload),
@@ -1921,6 +2071,7 @@ function App() {
     setSessions((prev) => [placeholder, ...prev]);
     setBlocksBySession((prev) => ({ ...prev, [sessionId]: [] }));
     setConclusionBySession((prev) => ({ ...prev, [sessionId]: "" }));
+    setActivityBySession((prev) => ({ ...prev, [sessionId]: [] }));
 
     try {
       const meta =
@@ -1958,6 +2109,11 @@ function App() {
         return next;
       });
       setConclusionBySession((prev) => {
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      });
+      setActivityBySession((prev) => {
         const next = { ...prev };
         delete next[sessionId];
         return next;
@@ -2004,6 +2160,7 @@ function App() {
         connectRemoteStream(activeSessionId, 0);
       }
       const now = Date.now();
+      setActivityBySession((prev) => ({ ...prev, [activeSessionId]: [] }));
       setRunStartedAtBySession((prev) => ({ ...prev, [activeSessionId]: now }));
       setLastPromptBySession((prev) => ({ ...prev, [activeSessionId]: promptText }));
       setSessions((prev) =>
@@ -2139,6 +2296,11 @@ function App() {
         delete next[activeSession.id];
         return next;
       });
+      setActivityBySession((prev) => {
+        const next = { ...prev };
+        delete next[activeSession.id];
+        return next;
+      });
       await refreshSessions();
     } catch (e) {
       setErrorBanner(String(e));
@@ -2260,9 +2422,53 @@ function App() {
             </div>
         </div>
 
-        <div className="sidebarSectionTitle">Sessions</div>
+        <div className="sidebarSectionTitle">Projects</div>
+        <div className="projectList">
+          <button
+            type="button"
+            className={`projectRow ${activeProjectKey === "all" ? "active" : ""}`}
+            onClick={() => {
+              setActiveProjectKey("all");
+              if (!activeSessionId && sessions.length > 0) {
+                setActiveSessionId(sessions[0].id);
+                void loadSession(sessions[0]);
+              }
+            }}
+          >
+            <div className="projectTitle">All projects</div>
+            <div className="projectMeta muted mono">{sessions.length}</div>
+          </button>
+          {projectGroups.map((p) => (
+            <button
+              key={p.key}
+              type="button"
+              className={`projectRow ${p.key === activeProjectKey ? "active" : ""}`}
+              onClick={() => {
+                setActiveProjectKey(p.key);
+                const list = p.sessions;
+                const nextActive = list.some((s) => s.id === activeSessionId)
+                  ? activeSessionId
+                  : list[0]?.id ?? "";
+                if (nextActive && nextActive !== activeSessionId) {
+                  persistScrollStateForActiveSession();
+                  setActiveSessionId(nextActive);
+                  const s = list.find((x) => x.id === nextActive);
+                  if (s) void loadSession(s);
+                }
+              }}
+              title={p.path ?? ""}
+            >
+              <div className="projectTitle">{p.label}</div>
+              <div className="projectMeta muted mono">{p.sessions.length}</div>
+            </button>
+          ))}
+        </div>
+
+        <div className="sidebarSectionTitle">
+          Threads <span className="muted mono">{activeProjectLabel}</span>
+        </div>
         <div className="sessionList">
-          {sessions.map((s) => (
+          {sessionsForActiveProject.map((s) => (
             <button
               key={s.id}
               type="button"
@@ -2389,6 +2595,18 @@ function App() {
 		                esc to interrupt)
 		              </span>
 		            </div>
+                {recentRunActivity.length > 0 ? (
+                  <div className="runActivity">
+                    {recentRunActivity.map((a) => (
+                      <div key={a.id} className="runActivityItem">
+                        <span className="runActivityDot" aria-hidden>
+                          •
+                        </span>
+                        <span className="runActivityText">{a.text}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
 		          </div>
 		        ) : null}
 
@@ -2404,8 +2622,114 @@ function App() {
 	          markdownComponents={markdownComponents}
 	        />
 
+          {showTerminalDrawer ? (
+            <div className="terminalDrawer" role="region" aria-label="Terminal">
+              <div className="terminalDrawerHeader">
+                <div className="terminalDrawerTitle mono">Terminal</div>
+                <div className="terminalDrawerHint muted mono">
+                  cd &lt;path&gt; to set working directory
+                </div>
+                <div className="spacer" />
+                <button
+                  className="iconBtn"
+                  type="button"
+                  onClick={() => setShowTerminalDrawer(false)}
+                  aria-label="Close terminal"
+                  title="Close"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="terminalDrawerBody">
+                {IS_TAURI && !isRemote ? (
+                  <CwdShell
+                    className="drawer"
+                    initialCwd={cwd}
+                    onCwd={(next) => {
+                      if (cwd === next) return;
+                      setCwd(next);
+                    }}
+                    onError={(msg) => setErrorBanner(msg)}
+                  />
+                ) : (
+                  <div className="terminalDrawerEmpty muted">
+                    Terminal drawer is available in the macOS app (local mode).
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : null}
+
 	        <div className="composer">
 	          <div className="composerLeft">
+              <div className="composerTools">
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={!IS_TAURI || isRemote}
+                  title={
+                    !IS_TAURI || isRemote
+                      ? "Attachments are available in the macOS app (local mode)."
+                      : "Attach files"
+                  }
+                  onClick={async () => {
+                    if (!IS_TAURI || isRemote) return;
+                    setErrorBanner(null);
+                    try {
+                      const selected = await openDialog({ multiple: true });
+                      if (!selected) return;
+                      const paths = Array.isArray(selected) ? selected : [selected];
+                      const imported = await invoke<string[]>("import_dropped_files", {
+                        sessionId: activeSessionId || null,
+                        paths,
+                      });
+                      const next = imported.length > 0 ? imported : paths;
+                      insertPromptText(next.map(quotePathIfNeeded).join("\n"));
+                    } catch (e) {
+                      setErrorBanner(String(e));
+                    }
+                  }}
+                >
+                  Attach
+                </button>
+                <button
+                  className="btn"
+                  type="button"
+                  title="Insert $ to pick a skill"
+                  onClick={() => {
+                    insertPromptText("$");
+                    requestAnimationFrame(() => {
+                      const el = promptRef.current;
+                      if (!el) return;
+                      updateSkillPickerFromText(
+                        el.value,
+                        el.selectionStart ?? el.value.length,
+                      );
+                    });
+                  }}
+                >
+                  $
+                </button>
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={() => setShowTerminalDrawer((prev) => !prev)}
+                  disabled={!IS_TAURI || isRemote}
+                  title={
+                    !IS_TAURI || isRemote
+                      ? "Terminal drawer is available in the macOS app (local mode)."
+                      : showTerminalDrawer
+                        ? "Hide terminal"
+                        : "Show terminal"
+                  }
+                >
+                  Terminal
+                </button>
+                <div className="spacer" />
+                <div className="muted mono composerHint">
+                  enter to send • shift+enter newline • esc to interrupt
+                </div>
+              </div>
               <div className="promptWrap">
                 <textarea
                   className="prompt"
@@ -2818,6 +3142,18 @@ function App() {
                     Use default
                   </button>
                 ) : null}
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={() => {
+                    setShowSessionSettings(false);
+                    setShowTerminalDrawer(true);
+                  }}
+                  disabled={!IS_TAURI || isRemote}
+                  title={!IS_TAURI || isRemote ? "Terminal drawer is available in the macOS app (local mode)." : ""}
+                >
+                  Terminal
+                </button>
               </div>
               <div className="muted">
                 {activeSessionId
@@ -2825,35 +3161,6 @@ function App() {
                   : "Used when you start a new session."}
               </div>
             </div>
-
-            <details
-              onToggle={(e) => {
-                const open = (e.currentTarget as HTMLDetailsElement).open;
-                setShowCwdShell(open);
-                if (!open) {
-                  if (IS_TAURI && !isRemote) {
-                    void invoke("stop_shell").catch(() => {});
-                  }
-                }
-              }}
-            >
-              <summary className="detailsSummary">Advanced: zsh (cd …)</summary>
-              <div className="muted" style={{ marginTop: 8, marginBottom: 10 }}>
-                Type <span className="mono">cd &lt;path&gt;</span> and press{" "}
-                <span className="mono">Enter</span> to update the working directory.
-              </div>
-              {showCwdShell ? (
-                <CwdShell
-                  className="large"
-                  initialCwd={cwd}
-                  onCwd={(next) => {
-                    if (cwd === next) return;
-                    setCwd(next);
-                  }}
-                  onError={(msg) => setErrorBanner(msg)}
-                />
-              ) : null}
-            </details>
           </div>
         </div>
       ) : null}

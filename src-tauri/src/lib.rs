@@ -773,7 +773,6 @@ async fn persist_and_emit_stdout(
         if method == "thread/tokenUsage/updated"
             || method == "account/rateLimits/updated"
             || method == "item/reasoning/summaryPartAdded"
-            || method.starts_with("codex/event/")
         {
             return Ok(());
         }

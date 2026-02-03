@@ -51,6 +51,10 @@ body {
   color: var(--muted);
 }
 
+.spacer {
+  flex: 1;
+}
+
 .app {
   height: 100vh;
   display: grid;
@@ -102,6 +106,12 @@ body {
   letter-spacing: 0.08em;
 }
 
+.sidebarSectionTitle span {
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 600;
+}
+
 .sessionList {
   flex: 1;
   display: flex;
@@ -110,6 +120,54 @@ body {
   overflow: auto;
   padding-bottom: 8px;
   min-height: 0;
+}
+
+.projectList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: auto;
+  padding-bottom: 10px;
+  max-height: 190px;
+}
+
+.projectRow {
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 10px;
+  cursor: pointer;
+  color: var(--text);
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.projectRow:hover {
+  border-color: var(--input-border);
+  background: var(--panel-2);
+}
+
+.projectRow.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--focus-ring);
+  background: var(--selection);
+}
+
+.projectTitle {
+  font-size: 13px;
+  font-weight: 700;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.projectMeta {
+  flex-shrink: 0;
+  font-size: 12px;
 }
 
 .sessionRow {
@@ -190,6 +248,54 @@ body {
   background: var(--panel-2);
 }
 
+.terminalDrawer {
+  margin: 0 14px 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--panel);
+  box-shadow: 0 10px 26px rgba(31, 35, 40, 0.10);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 180px;
+  height: 260px;
+  max-height: 50vh;
+  resize: vertical;
+}
+
+.terminalDrawerHeader {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border-weak);
+  background: var(--panel-2);
+}
+
+.terminalDrawerTitle {
+  font-weight: 800;
+}
+
+.terminalDrawerHint {
+  font-size: 12px;
+}
+
+.terminalDrawerBody {
+  flex: 1;
+  min-height: 0;
+  padding: 10px 10px;
+  background: var(--panel-2);
+}
+
+.terminalDrawerEmpty {
+  height: 100%;
+  border: 1px dashed var(--border-weak);
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .filterBar {
   display: flex;
   gap: 10px;
@@ -230,6 +336,38 @@ body {
 
 .runBannerMeta {
   flex-shrink: 0;
+}
+
+.runActivity {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.runActivityItem {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-weak);
+  background: rgba(255, 252, 248, 0.6);
+  color: var(--muted);
+  font-size: 12px;
+  max-width: 100%;
+}
+
+.runActivityDot {
+  color: var(--accent);
+}
+
+.runActivityText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 70ch;
 }
 
 .search {
@@ -284,6 +422,22 @@ body {
   flex-direction: column;
   gap: 10px;
   min-width: 0;
+}
+
+.composerTools {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.composerTools .btn {
+  padding: 8px 10px;
+  border-radius: 999px;
+}
+
+.composerHint {
+  font-size: 12px;
 }
 
 .prompt {
@@ -470,8 +624,20 @@ body {
   background: transparent !important;
 }
 
-.cwdShell .xterm-viewport {
+.cwdShell:not(.drawer) .xterm-viewport {
   overflow: hidden !important;
+}
+
+.cwdShell.drawer {
+  height: 100%;
+  max-height: none;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.cwdShell.drawer .xterm-viewport {
+  overflow: auto !important;
 }
 
 .cwd:focus {
