@@ -206,6 +206,12 @@ fn sanitize_file_ext(ext: &str) -> String {
     }
 }
 
+fn should_ignore_codex_app_server_stderr_line(line: &str) -> bool {
+    // Codex may emit noisy errors for threads that exist in state db but have no rollout path
+    // recorded. This is not actionable for the GUI and can spam the timeline.
+    line.contains("state db missing rollout path for thread")
+}
+
 fn choose_initial_cwd(settings: &Settings, requested: Option<String>) -> Option<String> {
     let mut cwd = requested.and_then(|s| {
         let t = s.trim().to_string();
@@ -1010,6 +1016,9 @@ async fn stream_lines<R: tokio::io::AsyncRead + Unpin>(
     let mut wrote_codex_session_id = false;
     let mut pending_thread_id: Option<String> = None;
     while let Ok(Some(line)) = lines.next_line().await {
+        if stream_name == "stderr" && should_ignore_codex_app_server_stderr_line(&line) {
+            continue;
+        }
         let _ = file.write_all(line.as_bytes()).await;
         let _ = file.write_all(b"\n").await;
 

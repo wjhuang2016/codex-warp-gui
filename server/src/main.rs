@@ -390,6 +390,12 @@ fn is_executable(path: &Path) -> bool {
     true
 }
 
+fn should_ignore_codex_app_server_stderr_line(line: &str) -> bool {
+    // Codex may emit noisy errors for threads that exist in state db but have no rollout path
+    // recorded. This is not actionable for the GUI and can spam the timeline.
+    line.contains("state db missing rollout path for thread")
+}
+
 fn resolve_codex_executable(state: &AppState) -> anyhow::Result<PathBuf> {
     if let Some(p) = state.codex_path.clone() {
         if is_executable(&p) {
@@ -2144,6 +2150,9 @@ async fn stream_stderr(
 
     let mut lines = BufReader::new(&mut reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        if should_ignore_codex_app_server_stderr_line(&line) {
+            continue;
+        }
         let _ = file.write_all(line.as_bytes()).await;
         let _ = file.write_all(b"\n").await;
         broadcast_ui_event(
