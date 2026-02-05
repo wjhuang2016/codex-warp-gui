@@ -212,6 +212,38 @@ fn should_ignore_codex_app_server_stderr_line(line: &str) -> bool {
     line.contains("state db missing rollout path for thread")
 }
 
+fn strip_ansi_csi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                let _ = chars.next();
+            } else {
+                continue;
+            }
+            while let Some(c) = chars.next() {
+                let b = c as u32;
+                if (0x40..=0x7E).contains(&b) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '\u{9b}' {
+            while let Some(c) = chars.next() {
+                let b = c as u32;
+                if (0x40..=0x7E).contains(&b) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn choose_initial_cwd(settings: &Settings, requested: Option<String>) -> Option<String> {
     let mut cwd = requested.and_then(|s| {
         let t = s.trim().to_string();
@@ -1016,9 +1048,16 @@ async fn stream_lines<R: tokio::io::AsyncRead + Unpin>(
     let mut wrote_codex_session_id = false;
     let mut pending_thread_id: Option<String> = None;
     while let Ok(Some(line)) = lines.next_line().await {
-        if stream_name == "stderr" && should_ignore_codex_app_server_stderr_line(&line) {
-            continue;
-        }
+        let line = if stream_name == "stderr" {
+            let cleaned = strip_ansi_csi(&line);
+            if should_ignore_codex_app_server_stderr_line(&cleaned) {
+                continue;
+            }
+            cleaned
+        } else {
+            line
+        };
+
         let _ = file.write_all(line.as_bytes()).await;
         let _ = file.write_all(b"\n").await;
 
@@ -2152,12 +2191,16 @@ async fn read_session_stderr(
     let mut out = VecDeque::new();
     let mut lines = BufReader::new(file).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        let cleaned = strip_ansi_csi(&line);
+        if should_ignore_codex_app_server_stderr_line(&cleaned) {
+            continue;
+        }
         if let Some(max) = max_lines {
             while out.len() >= max {
                 out.pop_front();
             }
         }
-        out.push_back(line);
+        out.push_back(cleaned);
     }
     Ok(out.into_iter().collect())
 }

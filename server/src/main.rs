@@ -396,6 +396,38 @@ fn should_ignore_codex_app_server_stderr_line(line: &str) -> bool {
     line.contains("state db missing rollout path for thread")
 }
 
+fn strip_ansi_csi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                let _ = chars.next();
+            } else {
+                continue;
+            }
+            while let Some(c) = chars.next() {
+                let b = c as u32;
+                if (0x40..=0x7E).contains(&b) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '\u{9b}' {
+            while let Some(c) = chars.next() {
+                let b = c as u32;
+                if (0x40..=0x7E).contains(&b) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn resolve_codex_executable(state: &AppState) -> anyhow::Result<PathBuf> {
     if let Some(p) = state.codex_path.clone() {
         if is_executable(&p) {
@@ -1834,14 +1866,19 @@ async fn stream_session(
 
             // Replay stderr as raw lines (timestamps may be embedded in text).
             for raw in read_tail_lines(&stderr_path, tail).await {
+                let cleaned = strip_ansi_csi(&raw);
+                if should_ignore_codex_app_server_stderr_line(&cleaned) {
+                    continue;
+                }
+                let ts = now_ms();
                 backlog.push((
-                    now_ms(),
+                    ts,
                     seq,
                     UiEvent {
                         session_id: session_id.clone(),
-                        ts_ms: now_ms(),
+                        ts_ms: ts,
                         stream: "stderr".to_string(),
-                        raw,
+                        raw: cleaned,
                         json: None,
                     },
                 ));
@@ -2150,10 +2187,11 @@ async fn stream_stderr(
 
     let mut lines = BufReader::new(&mut reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        if should_ignore_codex_app_server_stderr_line(&line) {
+        let cleaned = strip_ansi_csi(&line);
+        if should_ignore_codex_app_server_stderr_line(&cleaned) {
             continue;
         }
-        let _ = file.write_all(line.as_bytes()).await;
+        let _ = file.write_all(cleaned.as_bytes()).await;
         let _ = file.write_all(b"\n").await;
         broadcast_ui_event(
             &state,
@@ -2161,7 +2199,7 @@ async fn stream_stderr(
                 session_id: session_id.clone(),
                 ts_ms: now_ms(),
                 stream: "stderr".to_string(),
-                raw: line,
+                raw: cleaned,
                 json: None,
             },
         )
