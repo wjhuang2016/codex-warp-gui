@@ -452,6 +452,21 @@ fn resolve_codex_executable(state: &AppState) -> anyhow::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    fn test_state(data_dir: PathBuf) -> AppState {
+        AppState {
+            data_dir,
+            codex_path: None,
+            codex_home: None,
+            runs: Arc::new(Mutex::new(HashMap::new())),
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            native_cache: Arc::new(Mutex::new(NativeCache {
+                built_at_ms: 0,
+                rollouts_by_session: HashMap::new(),
+                derived_by_session: HashMap::new(),
+            })),
+        }
+    }
+
     #[tokio::test]
     async fn extract_session_meta_triplet_falls_back_when_base_instructions_precedes_originator() {
         let mut path = std::env::temp_dir();
@@ -477,6 +492,111 @@ mod tests {
         assert_eq!(source.as_deref(), Some("exec"));
 
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn list_sessions_sorts_by_last_used_then_created() {
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!("codex-warp-data-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+
+        let state = test_state(data_dir.clone());
+
+        let id_a = format!("s-{}", Uuid::new_v4());
+        let id_b = format!("s-{}", Uuid::new_v4());
+
+        tokio::fs::create_dir_all(session_dir(&state, &id_a))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(session_dir(&state, &id_b))
+            .await
+            .unwrap();
+
+        let a_dir = session_dir(&state, &id_a);
+        let b_dir = session_dir(&state, &id_b);
+
+        let meta_a = SessionMeta {
+            id: id_a.clone(),
+            title: "A".to_string(),
+            created_at_ms: 1_000,
+            last_used_at_ms: 2_000,
+            cwd: None,
+            status: SessionStatus::Done,
+            codex_session_id: None,
+            context_window: None,
+            context_used_tokens: None,
+            context_left_pct: None,
+            events_path: a_dir.join("events.jsonl").to_string_lossy().to_string(),
+            stderr_path: a_dir.join("stderr.log").to_string_lossy().to_string(),
+            conclusion_path: a_dir.join("conclusion.md").to_string_lossy().to_string(),
+        };
+        write_meta(&meta_path(&state, &id_a), &meta_a).await.unwrap();
+
+        // last_used_at_ms=0 should be treated as created_at_ms for ordering.
+        let meta_b = SessionMeta {
+            id: id_b.clone(),
+            title: "B".to_string(),
+            created_at_ms: 3_000,
+            last_used_at_ms: 0,
+            cwd: None,
+            status: SessionStatus::Done,
+            codex_session_id: None,
+            context_window: None,
+            context_used_tokens: None,
+            context_left_pct: None,
+            events_path: b_dir.join("events.jsonl").to_string_lossy().to_string(),
+            stderr_path: b_dir.join("stderr.log").to_string_lossy().to_string(),
+            conclusion_path: b_dir.join("conclusion.md").to_string_lossy().to_string(),
+        };
+        write_meta(&meta_path(&state, &id_b), &meta_b).await.unwrap();
+
+        let Json(sessions) = list_sessions(State(state.clone())).await.unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, id_b);
+        assert_eq!(sessions[1].id, id_a);
+
+        let b = sessions.iter().find(|s| s.id == id_b).unwrap();
+        assert_eq!(b.last_used_at_ms, 3_000);
+
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn load_session_backlog_replays_warp_stdout_events_in_order() {
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!("codex-warp-data-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+
+        let state = test_state(data_dir.clone());
+        let session_id = format!("s-{}", Uuid::new_v4());
+        let dir = session_dir(&state, &session_id);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let events_path = dir.join("events.jsonl");
+        let line1 =
+            serde_json::json!({ "type": "app.prompt", "prompt": "Hello", "_ts_ms": 100u64 })
+                .to_string();
+        let line2 = serde_json::json!({
+            "type": "event_msg",
+            "payload": { "type": "assistant_message", "message": "World" },
+            "_ts_ms": 200u64
+        })
+        .to_string();
+        tokio::fs::write(&events_path, format!("{line1}\n{line2}\n"))
+            .await
+            .unwrap();
+
+        let backlog = load_session_backlog(&state, &session_id, Some(50))
+            .await
+            .unwrap();
+        assert_eq!(backlog.len(), 2);
+        assert_eq!(backlog[0].stream, "stdout");
+        assert_eq!(backlog[0].ts_ms, 100);
+        assert_eq!(backlog[0].raw, line1);
+        assert_eq!(backlog[1].ts_ms, 200);
+        assert_eq!(backlog[1].raw, line2);
+
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 }
 
@@ -972,12 +1092,21 @@ async fn native_session_meta(state: &AppState, session_id: &str) -> Option<Sessi
     let cwd = derived.cwd.clone();
 
     let session_id_owned = session_id.to_string();
-    let titles = tokio::task::spawn_blocking(move || load_codex_thread_titles(&codex_home))
+    let (titles, history) = tokio::task::spawn_blocking(move || {
+        (
+            load_codex_thread_titles(&codex_home),
+            load_codex_history(&codex_home),
+        )
+    })
     .await
     .unwrap_or_default();
 
-    let created_at_ms = file_mtime_ms(&earliest_path).await.unwrap_or_else(now_ms);
-    let last_used_at_ms = file_mtime_ms(&latest_path).await.unwrap_or_else(now_ms);
+    let mut created_at_ms = file_mtime_ms(&earliest_path).await.unwrap_or_else(now_ms);
+    let mut last_used_at_ms = file_mtime_ms(&latest_path).await.unwrap_or_else(now_ms);
+    if let Some(h) = history.get(&session_id_owned) {
+        created_at_ms = created_at_ms.min(h.first_ts_ms);
+        last_used_at_ms = last_used_at_ms.max(h.last_ts_ms);
+    }
 
     let title = titles.get(&session_id_owned).cloned().or_else(|| {
         derived
@@ -985,6 +1114,10 @@ async fn native_session_meta(state: &AppState, session_id: &str) -> Option<Sessi
             .as_deref()
             .filter(|t| should_show_rollout_user_text(t))
             .map(safe_title)
+    }).or_else(|| {
+        history.get(&session_id_owned).and_then(|h| {
+            should_show_rollout_user_text(&h.last_text).then(|| safe_title(&h.last_text))
+        })
     })?;
 
     Some(SessionMeta {
@@ -1032,7 +1165,12 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session
             let locked = state.native_cache.lock().await;
             locked.rollouts_by_session.clone()
         };
-        let titles = tokio::task::spawn_blocking(move || load_codex_thread_titles(&codex_home))
+        let (titles, history) = tokio::task::spawn_blocking(move || {
+            (
+                load_codex_thread_titles(&codex_home),
+                load_codex_history(&codex_home),
+            )
+        })
         .await
         .unwrap_or_default();
 
@@ -1057,12 +1195,17 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session
             }
             let cwd = derived.cwd.clone();
 
-            let created_at_ms = file_mtime_ms(&earliest_path).await.unwrap_or_else(now_ms);
+            let mut created_at_ms = file_mtime_ms(&earliest_path).await.unwrap_or_else(now_ms);
             let last_used_at_ms = if derived.latest_mtime_ms > 0 {
                 derived.latest_mtime_ms
             } else {
                 file_mtime_ms(&latest_path).await.unwrap_or_else(now_ms)
             };
+            let mut last_used_at_ms = last_used_at_ms;
+            if let Some(h) = history.get(&session_id) {
+                created_at_ms = created_at_ms.min(h.first_ts_ms);
+                last_used_at_ms = last_used_at_ms.max(h.last_ts_ms);
+            }
 
             let title = titles.get(&session_id).cloned().or_else(|| {
                 derived
@@ -1070,6 +1213,10 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session
                     .as_deref()
                     .filter(|t| should_show_rollout_user_text(t))
                     .map(safe_title)
+            }).or_else(|| {
+                history.get(&session_id).and_then(|h| {
+                    should_show_rollout_user_text(&h.last_text).then(|| safe_title(&h.last_text))
+                })
             });
             let Some(title) = title else {
                 // Hide sessions with no meaningful user prompt to keep the list close to the official app.
@@ -1778,29 +1925,28 @@ fn parse_rfc3339_ms(ts: &str) -> Option<u64> {
     Some(total_ms as u64)
 }
 
-async fn stream_session(
-    State(state): State<AppState>,
-    AxumPath(session_id): AxumPath<String>,
-    Query(q): Query<StreamQuery>,
-    _headers: HeaderMap,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, Response>
-{
-    let dir = session_dir(&state, &session_id);
+async fn load_session_backlog(
+    state: &AppState,
+    session_id: &str,
+    tail: Option<usize>,
+) -> Result<Vec<UiEvent>, Response> {
+    let dir = session_dir(state, session_id);
     let warp_exists = tokio::fs::metadata(&dir).await.ok().is_some_and(|m| m.is_dir());
     let native_paths = {
-        ensure_native_cache(&state).await;
+        ensure_native_cache(state).await;
         let locked = state.native_cache.lock().await;
-        locked.rollouts_by_session.get(&session_id).cloned()
+        locked.rollouts_by_session.get(session_id).cloned()
     };
     if !warp_exists && native_paths.is_none() {
         return Err((StatusCode::NOT_FOUND, "session not found").into_response());
     }
 
-    let tail = match q.tail {
+    let tail = match tail {
         Some(0) => 0,
         Some(n) => n.clamp(50, 50_000),
         None => 4000,
     };
+
     let events_path = dir.join("events.jsonl");
     let stderr_path = dir.join("stderr.log");
 
@@ -1808,7 +1954,7 @@ async fn stream_session(
     let mut seq: usize = 0;
 
     if tail > 0 {
-        if let Some(paths) = native_paths.clone() {
+        if let Some(paths) = native_paths {
             for path in paths {
                 for raw in read_tail_lines(&path, tail).await {
                     let mut json: Option<serde_json::Value> = None;
@@ -1827,7 +1973,7 @@ async fn stream_session(
                         ts_ms,
                         seq,
                         UiEvent {
-                            session_id: session_id.clone(),
+                            session_id: session_id.to_string(),
                             ts_ms,
                             stream: "stdout".to_string(),
                             raw,
@@ -1854,7 +2000,7 @@ async fn stream_session(
                     ts_ms,
                     seq,
                     UiEvent {
-                        session_id: session_id.clone(),
+                        session_id: session_id.to_string(),
                         ts_ms,
                         stream: "stdout".to_string(),
                         raw,
@@ -1875,7 +2021,7 @@ async fn stream_session(
                     ts,
                     seq,
                     UiEvent {
-                        session_id: session_id.clone(),
+                        session_id: session_id.to_string(),
                         ts_ms: ts,
                         stream: "stderr".to_string(),
                         raw: cleaned,
@@ -1892,6 +2038,17 @@ async fn stream_session(
     if tail > 0 && backlog.len() > tail {
         backlog = backlog.split_off(backlog.len() - tail);
     }
+    Ok(backlog)
+}
+
+async fn stream_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+    Query(q): Query<StreamQuery>,
+    _headers: HeaderMap,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, Response>
+{
+    let backlog = load_session_backlog(&state, &session_id, q.tail).await?;
 
     let tx = ensure_stream(&state, &session_id).await;
     let rx = tx.subscribe();

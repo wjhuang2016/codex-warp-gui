@@ -2807,6 +2807,11 @@ function App() {
               type="button"
               className={`sessionRow ${s.id === activeSessionId ? "active" : ""}`}
               onClick={() => {
+                if (s.id === activeSessionId) {
+                  void touchSession(s.id);
+                  setMobilePanel(null);
+                  return;
+                }
                 persistScrollStateForActiveSession();
                 void touchSession(s.id);
                 setActiveSessionId(s.id);
