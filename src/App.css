@@ -1197,6 +1197,22 @@ summary.detailsSummary::after {
   background: var(--accent);
 }
 
+.todoBox.progress {
+  border-color: var(--accent);
+  background: var(--selection);
+}
+
+.todoBox.progress::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
 .todoBox.done::after {
   content: "";
   position: absolute;
@@ -1218,6 +1234,17 @@ summary.detailsSummary::after {
 .todoItem.done .todoLabel {
   color: var(--muted);
   text-decoration: line-through;
+}
+
+.todoHint {
+  margin: -2px 0 10px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.todoPill {
+  margin-top: 1px;
+  flex-shrink: 0;
 }
 
 .usageList {

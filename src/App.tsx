@@ -374,6 +374,17 @@ type TodoItem = {
   done: boolean;
 };
 
+type PlanStepStatus = "pending" | "in_progress" | "completed";
+type PlanStep = {
+  step: string;
+  status: PlanStepStatus;
+};
+type PlanState = {
+  ts_ms: number;
+  explanation: string | null;
+  steps: PlanStep[];
+};
+
 type ActivityItem = {
   id: string;
   ts_ms: number;
@@ -495,6 +506,38 @@ function runActivityTextFromJson(json: unknown): string | null {
   if (path) parts.push(path);
   if (tool) parts.push(tool);
   return stripToolCitations(parts.filter(Boolean).join(" • "));
+}
+
+function normalizePlanStepStatus(status: unknown): PlanStepStatus {
+  const raw = typeof status === "string" ? status.trim() : "";
+  const lower = raw.toLowerCase();
+  if (lower === "inprogress" || lower === "in_progress" || lower === "in progress") return "in_progress";
+  if (lower === "completed" || lower === "done" || lower === "complete") return "completed";
+  return "pending";
+}
+
+function parsePlanUpdateFromJson(
+  json: unknown,
+): Omit<PlanState, "ts_ms"> | null {
+  if (!isObject(json)) return null;
+  const method = typeof (json as any).method === "string" ? String((json as any).method) : "";
+  if (!method.startsWith("turn/plan/")) return null;
+
+  const params = isObject((json as any).params) ? ((json as any).params as any) : null;
+  if (!params || !Array.isArray(params.plan)) return null;
+
+  const steps: PlanStep[] = [];
+  for (const item of params.plan) {
+    if (!isObject(item)) continue;
+    const step = typeof (item as any).step === "string" ? String((item as any).step).trim() : "";
+    if (!step) continue;
+    const status = normalizePlanStepStatus((item as any).status);
+    steps.push({ step, status });
+  }
+
+  const explanationRaw = params && typeof params.explanation === "string" ? String(params.explanation).trim() : "";
+  const explanation = explanationRaw ? explanationRaw : null;
+  return { explanation, steps };
 }
 
 function computeSkillTrigger(text: string, cursor: number): Omit<SkillPickerState, "selected"> | null {
@@ -625,6 +668,10 @@ function applyUiEventToBlocks(blocks: Block[], e: UiEvent): Block[] {
       method === "item/reasoning/summaryPartAdded" ||
       method.startsWith("codex/event/")
     ) {
+      return blocks;
+    }
+
+    if (method.startsWith("turn/plan/")) {
       return blocks;
     }
 
@@ -1188,6 +1235,7 @@ function App() {
   const [blocksBySession, setBlocksBySession] = useState<Record<string, Block[]>>({});
   const [conclusionBySession, setConclusionBySession] = useState<Record<string, string>>({});
   const [activityBySession, setActivityBySession] = useState<Record<string, ActivityItem[]>>({});
+  const [planBySession, setPlanBySession] = useState<Record<string, PlanState>>({});
   const [metricsBySession, setMetricsBySession] = useState<Record<string, ContextMetrics>>({});
   const [usageRecords, setUsageRecords] = useState<UsageRecord[]>([]);
   const [usageLoading, setUsageLoading] = useState(false);
@@ -1683,7 +1731,19 @@ function App() {
     return () => window.clearInterval(id);
   }, [activeSession?.status, activeSessionId]);
 
+  const activePlan = useMemo(
+    () => planBySession[activeSessionId] ?? null,
+    [activeSessionId, planBySession],
+  );
+  const planSteps = activePlan?.steps ?? [];
+  const planExplanation = activePlan?.explanation ?? null;
+
   const todos = useMemo(() => extractTodos(blocks), [blocks]);
+  const planDoneCount = planSteps.reduce((acc, s) => acc + (s.status === "completed" ? 1 : 0), 0);
+  const todosDoneCount = todos.reduce((acc, t) => acc + (t.done ? 1 : 0), 0);
+  const totalTodoCount = planSteps.length + todos.length;
+  const doneTodoCount = planDoneCount + todosDoneCount;
+  const hasAnyTodos = totalTodoCount > 0;
   const conclusion = useMemo(
     () => conclusionBySession[activeSessionId] ?? "",
     [activeSessionId, conclusionBySession],
@@ -1958,7 +2018,12 @@ function App() {
       });
 
       let nextBlocks: Block[] = [];
+      let nextPlan: PlanState | null = null;
       for (const evt of [...events, ...stderrEvents]) {
+        const plan = parsePlanUpdateFromJson(evt.json);
+        if (plan) {
+          nextPlan = { ts_ms: evt.ts_ms, explanation: plan.explanation, steps: plan.steps };
+        }
         nextBlocks = applyUiEventToBlocks(nextBlocks, evt);
       }
 
@@ -1967,6 +2032,13 @@ function App() {
         ...prev,
         [session.id]: stripToolCitations(conclusionText),
       }));
+      setPlanBySession((prev) => {
+        if (nextPlan) return { ...prev, [session.id]: nextPlan };
+        if (!(session.id in prev)) return prev;
+        const copy = { ...prev };
+        delete copy[session.id];
+        return copy;
+      });
     } catch (e) {
       setErrorBanner(String(e));
     } finally {
@@ -2058,6 +2130,22 @@ function App() {
           return;
         }
         if (!payload?.session_id) return;
+
+        const plan = parsePlanUpdateFromJson(payload.json);
+        if (plan) {
+          setPlanBySession((prev) => {
+            const cur = prev[payload.session_id];
+            if (cur && cur.ts_ms > payload.ts_ms) return prev;
+            return {
+              ...prev,
+              [payload.session_id]: {
+                ts_ms: payload.ts_ms,
+                explanation: plan.explanation,
+                steps: plan.steps,
+              },
+            };
+          });
+        }
 
         if (isObject(payload.json) && (payload.json as any).type === "app.prompt") {
           const p = (payload.json as any).prompt;
@@ -2204,6 +2292,21 @@ function App() {
 
     void listen<UiEvent>("codex_event", ({ payload }) => {
       if (!payload?.session_id) return;
+      const plan = parsePlanUpdateFromJson(payload.json);
+      if (plan) {
+        setPlanBySession((prev) => {
+          const cur = prev[payload.session_id];
+          if (cur && cur.ts_ms > payload.ts_ms) return prev;
+          return {
+            ...prev,
+            [payload.session_id]: {
+              ts_ms: payload.ts_ms,
+              explanation: plan.explanation,
+              steps: plan.steps,
+            },
+          };
+        });
+      }
       const activityText = runActivityTextFromJson(payload.json);
       if (activityText) {
         setActivityBySession((prev) => {
@@ -3287,18 +3390,40 @@ function App() {
 	            <div className="panelTitle">
 	              TODO{" "}
 	              <span className="muted">
-	                {todos.filter((t) => t.done).length}/{todos.length}
+	                {doneTodoCount}/{totalTodoCount}
 	              </span>
 	            </div>
-	            {todos.length > 0 ? (
-	              <ul className="todoList">
-	                {todos.map((t) => (
-	                  <li key={`${t.done ? "1" : "0"}:${t.text}`} className={`todoItem ${t.done ? "done" : ""}`}>
-	                    <span className={`todoBox ${t.done ? "done" : ""}`} aria-hidden />
-	                    <span className="todoLabel">{t.text}</span>
-	                  </li>
-	                ))}
-	              </ul>
+	            {hasAnyTodos ? (
+	              <>
+	                {planExplanation ? <div className="muted todoHint">{planExplanation}</div> : null}
+	                <ul className="todoList">
+	                  {planSteps.map((t, idx) => {
+	                    const isDone = t.status === "completed";
+	                    const isProgress = t.status === "in_progress";
+	                    const pillClass = isProgress ? "in_progress" : isDone ? "completed" : "";
+	                    const pillText = isProgress ? "in progress" : isDone ? "done" : "pending";
+	                    return (
+	                      <li key={`plan:${idx}:${t.step}`} className={`todoItem plan ${isDone ? "done" : ""}`}>
+	                        <span
+	                          className={`todoBox ${isDone ? "done" : isProgress ? "progress" : ""}`}
+	                          aria-hidden
+	                        />
+	                        <span className="todoLabel">{t.step}</span>
+	                        <span className={`pill todoPill ${pillClass}`}>{pillText}</span>
+	                      </li>
+	                    );
+	                  })}
+	                  {todos.map((t) => (
+	                    <li
+	                      key={`${t.done ? "1" : "0"}:${t.text}`}
+	                      className={`todoItem ${t.done ? "done" : ""}`}
+	                    >
+	                      <span className={`todoBox ${t.done ? "done" : ""}`} aria-hidden />
+	                      <span className="todoLabel">{t.text}</span>
+	                    </li>
+	                  ))}
+	                </ul>
+	              </>
 	            ) : (
 	              <div className="muted">No TODOs parsed yet.</div>
 	            )}

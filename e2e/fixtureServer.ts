@@ -55,6 +55,10 @@ async function writeWarpSession(params: {
   prompt: string;
   assistant: string;
   conclusion: string;
+  plan?: {
+    explanation?: string | null;
+    steps: Array<{ status: string; step: string }>;
+  };
 }): Promise<void> {
   const sessionDir = path.join(params.dataDir, "sessions", params.id);
   await mkdir(sessionDir, { recursive: true });
@@ -64,17 +68,37 @@ async function writeWarpSession(params: {
   const conclusionPath = path.join(sessionDir, "conclusion.md");
   const metaPath = path.join(sessionDir, "meta.json");
 
+  let seq = 1;
   const promptEvent = {
     type: "app.prompt",
     prompt: params.prompt,
-    _ts_ms: params.createdAtMs + 1,
+    _ts_ms: params.createdAtMs + seq,
   };
+  seq += 1;
   const assistantEvent = {
     method: "item/completed",
     params: { item: { type: "agentMessage", id: "agent-1", text: params.assistant } },
-    _ts_ms: params.createdAtMs + 2,
+    _ts_ms: params.createdAtMs + seq,
   };
-  await writeFile(eventsPath, `${JSON.stringify(promptEvent)}\n${JSON.stringify(assistantEvent)}\n`);
+  seq += 1;
+
+  const events = [promptEvent];
+  if (params.plan && Array.isArray(params.plan.steps) && params.plan.steps.length > 0) {
+    events.push({
+      method: "turn/plan/updated",
+      params: {
+        explanation: params.plan.explanation ?? null,
+        plan: params.plan.steps,
+      },
+      _ts_ms: params.createdAtMs + seq,
+    });
+    seq += 1;
+    assistantEvent._ts_ms = params.createdAtMs + seq;
+    seq += 1;
+  }
+  events.push(assistantEvent);
+
+  await writeFile(eventsPath, `${events.map((e) => JSON.stringify(e)).join("\n")}\n`);
   await writeFile(stderrPath, "");
   await writeFile(conclusionPath, params.conclusion);
 
@@ -126,6 +150,13 @@ export async function startFixtureServer(repoRoot: string): Promise<StartedServe
     lastUsedAtMs: now - 1_000,
     prompt: "Hello from A",
     assistant: "Here is a TODO:\n- [ ] alpha task\n\nDone.",
+    plan: {
+      explanation: "Plan steps from event stream.",
+      steps: [
+        { status: "inProgress", step: "Plan step 1" },
+        { status: "pending", step: "Plan step 2" },
+      ],
+    },
     conclusion: "# Conclusion A\n\n- ok\n",
   });
 

@@ -38,11 +38,14 @@ test.describe("remote web UI (server-hosted)", () => {
 
     // TODO panel should parse tasks from assistant markdown.
     await expect(page.locator(".todoLabel", { hasText: "alpha task" })).toBeVisible();
+    // And plan events should populate the TODO panel too.
+    await expect(page.locator(".todoLabel", { hasText: "Plan step 1" })).toBeVisible();
 
     // Switching sessions should render that session's blocks and TODOs (not stale from A).
     await sessionB.click();
     await expect(page.locator(".blockBody", { hasText: "Hello from B" })).toBeVisible();
     await expect(page.locator(".todoLabel", { hasText: "alpha task" })).toHaveCount(0);
+    await expect(page.locator(".todoLabel", { hasText: "Plan step 1" })).toHaveCount(0);
 
     // Switch back.
     await sessionA.click();
